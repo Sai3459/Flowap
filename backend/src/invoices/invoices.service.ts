@@ -12,6 +12,7 @@ import {
   ExtractionResult,
 } from './extraction-client.service';
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
+import { WorkflowEngineService } from '../workflow/workflow-engine.service';
 
 @Injectable()
 export class InvoicesService {
@@ -20,6 +21,7 @@ export class InvoicesService {
   constructor(
     private readonly database: DatabaseService,
     private readonly extraction: ExtractionClientService,
+    private readonly workflowEngine: WorkflowEngineService,
   ) {}
 
   private get db() {
@@ -150,12 +152,17 @@ export class InvoicesService {
       }
     }
 
-    const [updated] = await this.db
+    await this.db
       .update(invoices)
       .set({ status: 'PENDING_APPROVAL', updatedAt: new Date() })
-      .where(eq(invoices.id, invoiceId))
-      .returning();
-    return updated;
+      .where(eq(invoices.id, invoiceId));
+
+    // Side effect only — creates/advances the ApprovalInstance and may itself update
+    // the invoice's status to APPROVED/REJECTED if the workflow completes immediately.
+    await this.workflowEngine.startInstance(tenantId, invoiceId);
+
+    const [current] = await this.db.select().from(invoices).where(eq(invoices.id, invoiceId));
+    return current;
   }
 
   async correctField(tenantId: string, invoiceId: string, dto: CorrectFieldDto) {

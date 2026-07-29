@@ -19,7 +19,22 @@ class ExtractRequest(BaseModel):
 
 @app.post("/extract")
 async def extract(req: ExtractRequest):
-    if "inconsistent" in req.file_url:
+    if "lowamount" in req.file_url:
+        raw = {
+            "documentType": {"value": "INVOICE", "confidence": 0.99},
+            "invoiceNumber": {"value": "INV-2001", "confidence": 0.98},
+            "invoiceDate": {"value": "2026-07-20", "confidence": 0.96},
+            "dueDate": {"value": "2026-08-19", "confidence": 0.93},
+            "currency": {"value": "USD", "confidence": 0.99},
+            "vendorName": {"value": "Office Supplies Co.", "confidence": 0.97},
+            "subtotal": {"value": 450.00, "confidence": 0.97},
+            "taxAmount": {"value": 36.00, "confidence": 0.97},
+            "totalAmount": {"value": 486.00, "confidence": 0.97},
+            "lineItems": [
+                {"description": "Paper reams", "quantity": 30, "unitPrice": 15, "lineTotal": 450.00, "confidence": 0.96}
+            ],
+        }
+    elif "inconsistent" in req.file_url:
         raw = {
             "documentType": {"value": "INVOICE", "confidence": 0.99},
             "invoiceNumber": {"value": "INV-9001", "confidence": 0.96},

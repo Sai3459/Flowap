@@ -52,10 +52,17 @@ npx ts-node src/main.ts        # NOT npx tsx
 
 # 3. Extraction service (separate terminal)
 cd extraction-service
-pip install -r requirements.txt   # (generate via pip freeze once finalized)
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 export ANTHROPIC_API_KEY="sk-..."
-python3 -m uvicorn main:app --port 8001
+.venv/bin/python -m uvicorn main:app --port 8001
+
+# 3b. …or the mock, which needs no API key and is what the E2E checks above ran against.
+#     Serves a clean invoice ($1296), a low-amount one (url contains "lowamount", $486),
+#     and a deliberately inconsistent one (url contains "inconsistent").
+.venv/bin/python -m uvicorn mock_server:app --port 8001
 ```
+
+Tests: `cd backend && npm test` — Node's built-in runner, no DB or running server needed.
 
 API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
 
@@ -77,9 +84,8 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 3. **Workflow is a graph (`workflowDefinitions.graph` jsonb: `{nodes, edges}`), not a
    fixed N-level chain.** This is the anti-rigidity design — a visual builder sits on
    top, but power users can drop into raw graph/expression editing when a wizard runs
-   out of road. The workflow engine itself (evaluating the graph at runtime) is NOT YET
-   BUILT — `WorkflowDefinition`/`ApprovalInstance`/`ApprovalStep` tables exist in the
-   schema but there's no service consuming them yet. This is the next major module.
+   out of road. The engine that evaluates this at runtime is **built** — see
+   `src/workflow/` and the graph contract below.
 
 4. **Every table is tenant-scoped from day one** (`tenantId` FK on nearly everything).
    Tenant resolution is currently a raw `x-tenant-id` header for prototype convenience —
@@ -89,6 +95,44 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 5. **ERP integration is an overlay, not a replacement.** `ErpConnection` stores
    per-tenant connector config; the platform should feel like an upgrade sitting on top
    of the existing ERP, not a new system of record competing with it.
+
+## The workflow graph contract (`src/workflow/`)
+
+`WorkflowEngineService` walks a tenant's active `workflowDefinitions.graph`, creating
+`approvalSteps` rows and moving `approvalInstances.currentNodeId` as steps are decided.
+START and CONDITION nodes resolve in-memory without persisting; the engine only parks
+(and writes) at an APPROVAL node or a terminal node. Shapes live in
+`workflow-graph.types.ts`; `validateGraph()` enforces the structure below **at
+definition-creation time**, so the engine can assume a well-formed graph at runtime
+rather than re-checking invariants on every advance.
+
+**Node types.** `START` (exactly one per graph, one outgoing edge) · `APPROVAL` ·
+`CONDITION` · `END` (→ invoice `APPROVED`) · `REJECT` (→ invoice `REJECTED`).
+
+**APPROVAL nodes** need an approver (`approverType: 'USER'` + `approverIds`, or
+`'ROLE'` + `approverRole` resolved against tenant users) and a `mode`:
+- `ALL` — a parallel approval group; every approver must approve, and any single
+  rejection fails the node immediately without waiting for the rest.
+- `ANY` — first decision wins; an approval carries the node outright, while a rejection
+  only fails it once *every* approver has rejected.
+
+Sequential approval is just APPROVAL nodes chained by edges — there is no separate
+"level" concept. Optional `slaHours` sets each step's `slaDueAt`.
+
+**Edges** out of an APPROVAL node: the one plain edge is the approve path, plus at most
+one `onReject` and at most one `onSlaBreach` alternate exit. Use `isApproveEdge()` rather
+than testing flags by hand so the engine and validator can't drift. A rejected node with
+no `onReject` edge terminates the instance as REJECTED. Out of a CONDITION node: any
+number of edges carrying `condition: {op, value}` evaluated against a numeric invoice
+field (`field`), plus exactly one `isDefault` fallback. A non-numeric or null field
+matches nothing, so the default edge is taken.
+
+**Step statuses.** `PENDING`/`APPROVED`/`REJECTED` are the deciding states;
+`DELEGATED` and `SKIPPED` are excluded from node-outcome evaluation (see
+`resolveNodeOutcome`). Delegation marks the original step `DELEGATED` and creates a
+replacement `PENDING` step on the same node, inheriting the original `slaDueAt` so a
+handoff can't quietly reset the clock. Counting `DELEGATED` rows would deadlock an ALL
+node — there's a regression test for exactly that.
 
 ## What's built and verified (as of last session)
 - Full Drizzle schema, pushed to a real Postgres instance — 12 tables, all FKs correct
@@ -100,12 +144,33 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 - Verified live against a mock extraction server (no real Anthropic key was available in
   the build sandbox): a clean invoice sailed through to PENDING_APPROVAL automatically;
   a deliberately inconsistent invoice was caught, downgraded, and routed to NEEDS_REVIEW.
+- **Workflow engine** — `POST|GET /workflow-definitions`, `GET /workflow-definitions/:id`,
+  `GET /approvals/:invoiceId`, `POST /approvals/steps/:stepId/decide`,
+  `POST /approvals/steps/:stepId/delegate`, `GET /approvals/overdue`,
+  `POST /approvals/escalate-overdue`. `InvoicesService.runValidation()` calls
+  `startInstance()` when an invoice reaches PENDING_APPROVAL; the engine flips the invoice
+  to APPROVED/REJECTED when an instance completes. Verified live: amount-based branching
+  ($486 → single approver, $1296 → parallel managers → role-resolved controller),
+  rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
+  routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
+- **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
+  29 tests covering `resolveNodeOutcome`, `evaluateCondition`, and `validateGraph`. These
+  are the pure graph functions; anything touching the DB is still only verified by hand.
 
 ## Not yet built (in rough priority order)
-1. **Workflow engine** — evaluate `WorkflowDefinition.graph` at runtime, create
-   `ApprovalStep` rows, handle parallel/sequential/conditional approval, SLA/escalation.
-2. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack.
-3. **PO / goods-receipt matching** — `PurchaseOrder` table exists; no matching logic yet.
+1. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack. This is
+   also what makes the workflow engine's approver check real: `decideStep`/`delegateStep`
+   verify the caller is the step's assigned approver, but they compare against a
+   **client-supplied** `approverId` in the request body. That stops wrong-user and
+   accidental decisions; it is not authorization until the id comes from a session. When
+   this lands, `assertIsAssignedApprover` should read the session subject instead — the
+   check itself doesn't need to move.
+2. **PO / goods-receipt matching** — `PurchaseOrder` table exists; no matching logic yet.
+   `runValidation()` in `invoices.service.ts` is where this plugs in, next to the existing
+   duplicate check.
+3. **Frontend** — nothing built yet. React + TS, Vite. Priority screens: invoice list,
+   invoice detail with confidence-flagged fields, exception queue, mobile approval view.
+   Note the per-field confidence design is currently only observable via the API.
 4. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
 5. **AI copilot** — natural-language invoice search, GL coding suggestions, plain-language
    explanations of why an invoice is stuck (the extraction service's `_consistency_warnings`
@@ -113,10 +178,34 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 6. **Feedback loop** — `/feedback` endpoint on the extraction service is a stub; needs to
    actually persist corrections per tenant/vendor-layout and feed them back into the
    extraction prompt as few-shot examples.
-7. **Frontend** — nothing built yet. React + TS, Vite. Priority screens: invoice list,
-   invoice detail with confidence-flagged fields, exception queue, mobile approval view.
-8. **Vendor portal** — separate, simplified auth context and shell.
-9. **ERP connectors** — `ErpConnection` config storage exists; no actual connector logic.
+7. **Vendor portal** — separate, simplified auth context and shell.
+8. **ERP connectors** — `ErpConnection` config storage exists; no actual connector logic.
+
+### Known gaps in the workflow engine
+- **SLA escalation has no scheduler.** The mechanism works, but
+  `POST /approvals/escalate-overdue` has to be called to run it. Production should drive
+  `escalateOverdueSteps()` from a cron/queue; nothing here does that yet.
+- **`advance()` is not transactional.** It performs several sequential writes (step
+  inserts, `currentNodeId` updates, invoice status), so a crash mid-advance can leave an
+  instance parked between nodes. Wrap the traversal in a Drizzle transaction before this
+  carries real volume.
+- **Two approvers deciding the last step of an ALL node concurrently can double-advance.**
+  The `PENDING` check and the outcome evaluation are separate reads with no row lock.
+  A `SELECT ... FOR UPDATE` on the step (or a unique constraint on
+  `instanceId+nodeId+approverId`) is the fix.
+- **No cycle detection in `validateGraph`.** A graph whose edges loop back would make
+  `advance()` spin. Well-formed graphs from the builder won't, but hand-authored jsonb could.
+- **Definitions can be created and read, but not updated or deactivated via the API.**
+  There is no PATCH/PUT/DELETE on `/workflow-definitions` — changing or retiring a
+  definition currently means touching the DB directly (that's how the `isActive` flag got
+  flipped during testing). `createDefinition` also never sets `version`, so every
+  definition is version 1 and `startInstance()`'s version ordering never actually
+  discriminates; publishing a v2 needs an endpoint that increments it and deactivates the
+  prior row.
+- **Running instances re-read their definition's graph on every decision.** `decideStep`
+  loads the definition fresh rather than snapshotting the graph onto the instance, so a
+  graph edited underneath an in-flight instance changes that instance's remaining path.
+  Pinning the graph (or the `version`) per instance is the safer model.
 
 ## Conventions
 - Tenant ID always comes first in service method signatures: `(tenantId, ...)`.

@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
 import { ApiHeader, ApiTags } from '@nestjs/swagger';
 import { WorkflowEngineService } from './workflow-engine.service';
-import { CreateWorkflowDefinitionDto, DecideStepDto } from './dto/workflow.dto';
+import { CreateWorkflowDefinitionDto, DecideStepDto, DelegateStepDto } from './dto/workflow.dto';
 
 @ApiTags('workflow-definitions')
 @ApiHeader({ name: 'x-tenant-id', required: true })
@@ -31,6 +31,17 @@ export class WorkflowDefinitionsController {
 export class ApprovalsController {
   constructor(private readonly workflowEngine: WorkflowEngineService) {}
 
+  // Declared before ':invoiceId' so the literal path isn't swallowed by the param route.
+  @Get('overdue')
+  overdue(@Headers('x-tenant-id') tenantId: string) {
+    return this.workflowEngine.findOverdueSteps(tenantId);
+  }
+
+  @Post('escalate-overdue')
+  escalateOverdue(@Headers('x-tenant-id') tenantId: string) {
+    return this.workflowEngine.escalateOverdueSteps(tenantId);
+  }
+
   @Get(':invoiceId')
   getInstance(@Headers('x-tenant-id') tenantId: string, @Param('invoiceId') invoiceId: string) {
     return this.workflowEngine.getInstance(tenantId, invoiceId);
@@ -43,5 +54,14 @@ export class ApprovalsController {
     @Body() dto: DecideStepDto,
   ) {
     return this.workflowEngine.decideStep(tenantId, stepId, dto);
+  }
+
+  @Post('steps/:stepId/delegate')
+  delegateStep(
+    @Headers('x-tenant-id') tenantId: string,
+    @Param('stepId') stepId: string,
+    @Body() dto: DelegateStepDto,
+  ) {
+    return this.workflowEngine.delegateStep(tenantId, stepId, dto);
   }
 }

@@ -1,5 +1,11 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import {
   approvalInstances,
@@ -9,9 +15,9 @@ import {
   users,
   workflowDefinitions,
 } from '../db/schema';
-import { WorkflowEdge, WorkflowGraph, WorkflowNode } from './workflow-graph.types';
+import { isApproveEdge, WorkflowEdge, WorkflowGraph, WorkflowNode } from './workflow-graph.types';
 import { validateGraph } from './workflow-graph.validator';
-import { CreateWorkflowDefinitionDto, DecideStepDto } from './dto/workflow.dto';
+import { CreateWorkflowDefinitionDto, DecideStepDto, DelegateStepDto } from './dto/workflow.dto';
 
 type ApprovalInstanceRow = typeof approvalInstances.$inferSelect;
 type ApprovalStepRow = typeof approvalSteps.$inferSelect;
@@ -58,6 +64,9 @@ export class WorkflowEngineService {
       .select()
       .from(workflowDefinitions)
       .where(and(eq(workflowDefinitions.tenantId, tenantId), eq(workflowDefinitions.isActive, true)))
+      // Highest version wins, newest as tiebreak — without an explicit order, a tenant
+      // with two active definitions would get an arbitrary one.
+      .orderBy(desc(workflowDefinitions.version), desc(workflowDefinitions.createdAt))
       .limit(1);
 
     if (!def) {
@@ -89,7 +98,7 @@ export class WorkflowEngineService {
 
     for (;;) {
       if (node.type === 'START') {
-        node = this.nextNode(graph, node, (e) => !e.onReject);
+        node = this.nextNode(graph, node, isApproveEdge);
         continue;
       }
 
@@ -169,26 +178,8 @@ export class WorkflowEngineService {
    * as a whole was rejected (falling back to terminating the instance if there is none).
    */
   async decideStep(tenantId: string, stepId: string, dto: DecideStepDto) {
-    const [step] = await this.db.select().from(approvalSteps).where(eq(approvalSteps.id, stepId));
-    if (!step) throw new NotFoundException('Approval step not found');
-    if (step.status !== 'PENDING') {
-      throw new BadRequestException(`Step ${stepId} already decided (${step.status})`);
-    }
-
-    const [instance] = await this.db
-      .select()
-      .from(approvalInstances)
-      .where(eq(approvalInstances.id, step.instanceId));
-    if (!instance) throw new NotFoundException('Approval instance not found');
-
-    const [def] = await this.db
-      .select()
-      .from(workflowDefinitions)
-      .where(and(eq(workflowDefinitions.id, instance.workflowId), eq(workflowDefinitions.tenantId, tenantId)));
-    if (!def) throw new NotFoundException('Workflow definition not found');
-
-    const graph = def.graph as WorkflowGraph;
-    const node = this.findNode(graph, step.nodeId);
+    const { step, instance, graph, node } = await this.loadPendingStep(tenantId, stepId);
+    this.assertIsAssignedApprover(step, dto.approverId);
 
     await this.db
       .update(approvalSteps)
@@ -216,7 +207,7 @@ export class WorkflowEngineService {
       await this.skipPendingSiblings(siblingSteps, stepId);
 
       if (outcome === 'APPROVED') {
-        const nextNode = this.nextNode(graph, node, (e) => !e.onReject);
+        const nextNode = this.nextNode(graph, node, isApproveEdge);
         const updatedInstance = await this.setCurrentNode(instance, nextNode.id);
         await this.advance(tenantId, updatedInstance, graph);
       } else {
@@ -236,7 +227,183 @@ export class WorkflowEngineService {
     return this.getInstance(tenantId, instance.invoiceId);
   }
 
-  private async skipPendingSiblings(steps: ApprovalStepRow[], decidedStepId: string) {
+  /**
+   * Hands a pending step off to a different approver: the original step becomes
+   * DELEGATED (a terminal, non-deciding state) and a fresh PENDING step is created on
+   * the same node for the delegate, inheriting the original's SLA deadline so
+   * delegating can't be used to quietly reset the clock.
+   */
+  async delegateStep(tenantId: string, stepId: string, dto: DelegateStepDto) {
+    const { step, instance, node } = await this.loadPendingStep(tenantId, stepId);
+    this.assertIsAssignedApprover(step, dto.fromApproverId);
+
+    if (dto.toApproverId === dto.fromApproverId) {
+      throw new BadRequestException('Cannot delegate a step to its current approver');
+    }
+
+    const [delegate] = await this.db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.id, dto.toApproverId), eq(users.tenantId, tenantId)));
+    if (!delegate) throw new NotFoundException('Delegate user not found in this tenant');
+
+    await this.db
+      .update(approvalSteps)
+      .set({ status: 'DELEGATED', comment: dto.comment, actedAt: new Date() })
+      .where(eq(approvalSteps.id, stepId));
+
+    const [replacement] = await this.db
+      .insert(approvalSteps)
+      .values({
+        instanceId: instance.id,
+        nodeId: node.id,
+        approverId: dto.toApproverId,
+        slaDueAt: step.slaDueAt,
+      })
+      .returning();
+
+    await this.logAudit(tenantId, instance.invoiceId, 'APPROVAL_STEP_DELEGATED', {
+      nodeId: node.id,
+      fromStepId: stepId,
+      toStepId: replacement.id,
+      fromApproverId: dto.fromApproverId,
+      toApproverId: dto.toApproverId,
+    });
+
+    return this.getInstance(tenantId, instance.invoiceId);
+  }
+
+  /** Pending steps whose SLA deadline has already passed, for a dashboard or notifier. */
+  async findOverdueSteps(tenantId: string) {
+    return this.db
+      .select({
+        step: approvalSteps,
+        invoiceId: approvalInstances.invoiceId,
+        workflowId: approvalInstances.workflowId,
+      })
+      .from(approvalSteps)
+      .innerJoin(approvalInstances, eq(approvalSteps.instanceId, approvalInstances.id))
+      .innerJoin(workflowDefinitions, eq(approvalInstances.workflowId, workflowDefinitions.id))
+      .where(
+        and(
+          eq(workflowDefinitions.tenantId, tenantId),
+          eq(approvalSteps.status, 'PENDING'),
+          isNull(approvalInstances.completedAt),
+          lt(approvalSteps.slaDueAt, new Date()),
+        ),
+      );
+  }
+
+  /**
+   * Acts on SLA breaches: for each still-parked node whose deadline has passed, routes
+   * down that node's onSlaBreach edge if it has one. A node without such an edge is
+   * left pending on purpose — auto-deciding someone's invoice because a timer elapsed
+   * is not a safe default — but the breach is still recorded as an audit event so it
+   * surfaces rather than passing silently.
+   *
+   * Invoked on demand (endpoint) rather than on a timer; production wires this to the
+   * same scheduler/queue that will drive the rest of the pipeline.
+   */
+  async escalateOverdueSteps(tenantId: string) {
+    const overdue = await this.findOverdueSteps(tenantId);
+
+    // One breach per parked node, not per step — a parallel node with three late
+    // approvers is a single escalation decision.
+    const byInstanceNode = new Map<string, (typeof overdue)[number]>();
+    for (const row of overdue) {
+      byInstanceNode.set(`${row.step.instanceId}:${row.step.nodeId}`, row);
+    }
+
+    const escalated: { invoiceId: string; nodeId: string; routedTo: string | null }[] = [];
+
+    for (const row of byInstanceNode.values()) {
+      const [instance] = await this.db
+        .select()
+        .from(approvalInstances)
+        .where(eq(approvalInstances.id, row.step.instanceId));
+      if (!instance || instance.completedAt) continue;
+
+      // Only escalate the node the instance is actually parked at; a late step on a
+      // node the graph has already moved past is stale, not a live breach.
+      if (instance.currentNodeId !== row.step.nodeId) continue;
+
+      const [def] = await this.db
+        .select()
+        .from(workflowDefinitions)
+        .where(eq(workflowDefinitions.id, instance.workflowId));
+      if (!def) continue;
+
+      const graph = def.graph as WorkflowGraph;
+      const node = this.findNode(graph, row.step.nodeId);
+      const slaEdge = graph.edges.find((e) => e.from === node.id && e.onSlaBreach);
+
+      await this.logAudit(tenantId, instance.invoiceId, 'APPROVAL_SLA_BREACHED', {
+        nodeId: node.id,
+        slaDueAt: row.step.slaDueAt,
+        escalated: Boolean(slaEdge),
+      });
+
+      if (!slaEdge) {
+        escalated.push({ invoiceId: instance.invoiceId, nodeId: node.id, routedTo: null });
+        continue;
+      }
+
+      const siblingSteps = await this.db
+        .select()
+        .from(approvalSteps)
+        .where(and(eq(approvalSteps.instanceId, instance.id), eq(approvalSteps.nodeId, node.id)));
+      await this.skipPendingSiblings(siblingSteps, null);
+
+      const nextNode = this.findNode(graph, slaEdge.to);
+      const updatedInstance = await this.setCurrentNode(instance, nextNode.id);
+      await this.advance(tenantId, updatedInstance, graph);
+
+      escalated.push({ invoiceId: instance.invoiceId, nodeId: node.id, routedTo: nextNode.id });
+    }
+
+    return { escalatedCount: escalated.length, escalated };
+  }
+
+  /** Loads a step with its instance/graph context, enforcing tenant scope and PENDING status. */
+  private async loadPendingStep(tenantId: string, stepId: string) {
+    const [step] = await this.db.select().from(approvalSteps).where(eq(approvalSteps.id, stepId));
+    if (!step) throw new NotFoundException('Approval step not found');
+    if (step.status !== 'PENDING') {
+      throw new BadRequestException(`Step ${stepId} already decided (${step.status})`);
+    }
+
+    const [instance] = await this.db
+      .select()
+      .from(approvalInstances)
+      .where(eq(approvalInstances.id, step.instanceId));
+    if (!instance) throw new NotFoundException('Approval instance not found');
+
+    // Tenant scope is enforced here: a step belonging to another tenant's workflow
+    // resolves to no definition and 404s before any mutation happens.
+    const [def] = await this.db
+      .select()
+      .from(workflowDefinitions)
+      .where(and(eq(workflowDefinitions.id, instance.workflowId), eq(workflowDefinitions.tenantId, tenantId)));
+    if (!def) throw new NotFoundException('Workflow definition not found');
+
+    const graph = def.graph as WorkflowGraph;
+    return { step, instance, graph, node: this.findNode(graph, step.nodeId) };
+  }
+
+  /**
+   * A step may only be acted on by the approver it was assigned to. Note this compares
+   * against a client-supplied id, so it is not yet real authorization — it stops wrong-user
+   * and accidental decisions, and becomes enforceable for real when `approverId` starts
+   * coming from an SSO session instead of the request body.
+   */
+  private assertIsAssignedApprover(step: ApprovalStepRow, claimedApproverId: string) {
+    if (step.approverId !== claimedApproverId) {
+      throw new ForbiddenException(`Step ${step.id} is not assigned to approver ${claimedApproverId}`);
+    }
+  }
+
+  /** `decidedStepId` is null when nothing was decided — e.g. an SLA breach skipping the whole node. */
+  private async skipPendingSiblings(steps: ApprovalStepRow[], decidedStepId: string | null) {
     const pendingOthers = steps.filter((s) => s.id !== decidedStepId && s.status === 'PENDING');
     if (pendingOthers.length === 0) return;
     await this.db
@@ -314,7 +481,8 @@ export class WorkflowEngineService {
   }
 }
 
-function evaluateCondition(value: number, condition: { op: string; value: number }): boolean {
+export function evaluateCondition(value: number, condition: { op: string; value: number }): boolean {
+  if (!Number.isFinite(value)) return false; // a missing/non-numeric field matches nothing, so the default edge is taken
   switch (condition.op) {
     case '>':
       return value > condition.value;
@@ -333,6 +501,9 @@ function evaluateCondition(value: number, condition: { op: string; value: number
   }
 }
 
+/** Only the fields the outcome rules actually read, so tests needn't build whole DB rows. */
+export type StepOutcomeView = { status: ApprovalStepRow['status'] };
+
 /**
  * Returns 'APPROVED'/'REJECTED' once the node's mode is satisfied, or null while still
  * waiting on other parallel approvers.
@@ -340,16 +511,28 @@ function evaluateCondition(value: number, condition: { op: string; value: number
  *   the node immediately.
  * - ANY: the first decision resolves the node — an approval wins outright, a rejection
  *   only fails the node once every approver has rejected.
+ *
+ * DELEGATED and SKIPPED steps are excluded: neither carries a decision, and a delegated
+ * step is always superseded by a fresh PENDING one. Counting them would deadlock an ALL
+ * node (its `every APPROVED` test could never pass once a step was handed off).
  */
-function resolveNodeOutcome(node: WorkflowNode, steps: ApprovalStepRow[]): 'APPROVED' | 'REJECTED' | null {
+export function resolveNodeOutcome(
+  node: Pick<WorkflowNode, 'mode'>,
+  steps: StepOutcomeView[],
+): 'APPROVED' | 'REJECTED' | null {
+  const live = steps.filter(
+    (s) => s.status === 'PENDING' || s.status === 'APPROVED' || s.status === 'REJECTED',
+  );
+  if (live.length === 0) return null; // nothing deciding yet — never report a vacuous approval
+
   if (node.mode === 'ANY') {
-    if (steps.some((s) => s.status === 'APPROVED')) return 'APPROVED';
-    if (steps.every((s) => s.status === 'REJECTED')) return 'REJECTED';
+    if (live.some((s) => s.status === 'APPROVED')) return 'APPROVED';
+    if (live.every((s) => s.status === 'REJECTED')) return 'REJECTED';
     return null;
   }
 
   // mode === 'ALL'
-  if (steps.some((s) => s.status === 'REJECTED')) return 'REJECTED';
-  if (steps.every((s) => s.status === 'APPROVED')) return 'APPROVED';
+  if (live.some((s) => s.status === 'REJECTED')) return 'REJECTED';
+  if (live.every((s) => s.status === 'APPROVED')) return 'APPROVED';
   return null;
 }

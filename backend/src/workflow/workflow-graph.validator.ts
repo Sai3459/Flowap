@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { WorkflowGraph, WorkflowNode } from './workflow-graph.types';
+import { isApproveEdge, WorkflowGraph, WorkflowNode } from './workflow-graph.types';
 
 /**
  * Structural validation for a tenant-authored graph, run once at definition-creation
@@ -53,13 +53,22 @@ function validateNodeOutgoingEdges(node: WorkflowNode, edges: WorkflowGraph['edg
           `APPROVAL node ${node.id} needs approverType, approverIds/approverRole, and mode`,
         );
       }
-      const approveEdges = edges.filter((e) => !e.onReject);
+      const approveEdges = edges.filter(isApproveEdge);
       const rejectEdges = edges.filter((e) => e.onReject);
+      const slaEdges = edges.filter((e) => e.onSlaBreach);
       if (approveEdges.length !== 1) {
         throw new BadRequestException(`APPROVAL node ${node.id} must have exactly one approve edge`);
       }
       if (rejectEdges.length > 1) {
         throw new BadRequestException(`APPROVAL node ${node.id} may have at most one reject edge`);
+      }
+      if (slaEdges.length > 1) {
+        throw new BadRequestException(`APPROVAL node ${node.id} may have at most one SLA-breach edge`);
+      }
+      if (slaEdges.length > 0 && !node.slaHours) {
+        throw new BadRequestException(
+          `APPROVAL node ${node.id} has an SLA-breach edge but no slaHours to trigger it`,
+        );
       }
       break;
     }

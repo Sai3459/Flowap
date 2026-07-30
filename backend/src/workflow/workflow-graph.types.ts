@@ -33,6 +33,16 @@ export interface WorkflowEdge {
   condition?: { op: ConditionOp; value: number }; // only meaningful when `from` is a CONDITION node
   isDefault?: boolean; // fallback edge from a CONDITION node when no condition matches
   onReject?: boolean; // from an APPROVAL node, taken when that node's approval is rejected
+  onSlaBreach?: boolean; // from an APPROVAL node, taken when its SLA elapses with steps still pending
+}
+
+/**
+ * An APPROVAL node's normal "everyone approved" continuation. onReject/onSlaBreach
+ * edges are alternate exits from the same node, so the happy path is whatever is
+ * left over — keep this in one place so the engine and validator agree on it.
+ */
+export function isApproveEdge(edge: WorkflowEdge): boolean {
+  return !edge.onReject && !edge.onSlaBreach;
 }
 
 export interface WorkflowGraph {

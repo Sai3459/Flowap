@@ -1,7 +1,14 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { and, desc, eq, inArray, ne } from 'drizzle-orm';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { and, desc, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import {
+  approvalInstances,
   invoices,
   invoiceLineItems,
   invoiceExceptions,
@@ -19,6 +26,7 @@ import {
 } from './extraction-client.service';
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { WorkflowEngineService } from '../workflow/workflow-engine.service';
+import { VendorsService } from '../vendors/vendors.service';
 
 /**
  * Header fields a human may correct, and how the incoming string maps onto the column's
@@ -28,21 +36,90 @@ import { WorkflowEngineService } from '../workflow/workflow-engine.service';
  * `vendorName` is deliberately absent: it has a confidence score but no column here, and
  * correcting it properly means re-linking a Vendor row.
  */
-const CORRECTABLE_FIELDS: Record<string, { parse: (raw: string) => unknown }> = {
-  invoiceNumber: { parse: (raw) => raw.trim() },
-  // Correcting the PO number is the main way a reviewer resolves a MISSING_PO exception,
-  // so it has to be editable. Note the match does not automatically re-run on correction.
-  poNumber: { parse: (raw) => raw.trim() },
+interface CorrectableField {
+  parse: (raw: string) => unknown;
+  /**
+   * True when this field is an input to a validation check, so correcting it invalidates
+   * whatever the last validation concluded. Set for:
+   *   invoiceNumber -> duplicate detection keys on it
+   *   poNumber      -> selects which PO to match against
+   *   currency      -> compared against the PO's currency
+   *   subtotal      -> the net figure compared against the PO total
+   * Deliberately not set for taxAmount/totalAmount (the PO comparison is net-to-net) or for
+   * the date and reference fields, none of which any current check reads.
+   */
+  revalidates?: boolean;
+}
+
+export const CORRECTABLE_FIELDS: Record<string, CorrectableField> = {
+  invoiceNumber: { parse: (raw) => raw.trim(), revalidates: true },
+  // Correcting the PO number is the main way a reviewer resolves a MISSING_PO exception.
+  poNumber: { parse: (raw) => raw.trim(), revalidates: true },
   referenceNumber: { parse: (raw) => raw.trim() },
   vendorTaxId: { parse: (raw) => raw.trim() },
-  currency: { parse: (raw) => raw.trim().toUpperCase() },
+  currency: { parse: (raw) => raw.trim().toUpperCase(), revalidates: true },
   invoiceDate: { parse: (raw) => parseDateOrThrow(raw, 'invoiceDate') },
   dueDate: { parse: (raw) => parseDateOrThrow(raw, 'dueDate') },
   supplyDate: { parse: (raw) => parseDateOrThrow(raw, 'supplyDate') },
-  subtotal: { parse: (raw) => parseMoneyOrThrow(raw, 'subtotal') },
+  subtotal: { parse: (raw) => parseMoneyOrThrow(raw, 'subtotal'), revalidates: true },
   taxAmount: { parse: (raw) => parseMoneyOrThrow(raw, 'taxAmount') },
   totalAmount: { parse: (raw) => parseMoneyOrThrow(raw, 'totalAmount') },
 };
+
+/** Statuses from which re-running validation is meaningful. */
+const REVALIDATABLE_STATUSES = ['EXCEPTION', 'NEEDS_REVIEW'] as const;
+
+/**
+ * Decides whether a re-validation should actually run, given where the invoice currently is.
+ * Pure so the rules are testable without a database.
+ *
+ * The hard constraint is `hasApprovalInstance`: `approvalInstances.invoiceId` is UNIQUE, so
+ * re-running validation on an invoice already in an approval flow would attempt a second
+ * instance and blow up on the constraint. Beyond that, an invoice being actively approved
+ * shouldn't have its approval silently restarted because someone fixed a date.
+ */
+export function revalidationDecision(params: {
+  status: string;
+  hasApprovalInstance: boolean;
+  outstandingReviewFields: string[];
+  force: boolean;
+}): { proceed: boolean; reason: string } {
+  const { status, hasApprovalInstance, outstandingReviewFields, force } = params;
+
+  if (hasApprovalInstance) {
+    return { proceed: false, reason: 'invoice already has an approval instance' };
+  }
+  if (!REVALIDATABLE_STATUSES.includes(status as (typeof REVALIDATABLE_STATUSES)[number])) {
+    return { proceed: false, reason: `status ${status} is not re-validatable` };
+  }
+  // An automatic re-validation respects the confidence gate; an explicit request from a human
+  // overrides it, which is the only way an invoice held by a low-confidence *line item* can
+  // move at all, since line items aren't correctable yet.
+  if (!force && outstandingReviewFields.length > 0) {
+    return {
+      proceed: false,
+      reason: `still awaiting review of: ${outstandingReviewFields.join(', ')}`,
+    };
+  }
+  return { proceed: true, reason: force ? 'forced' : 'ready' };
+}
+
+/**
+ * Whether a correction must be refused because the invoice is mid-approval.
+ *
+ * Only fields that feed a validation check are blocked. Accepting one would leave the invoice
+ * showing conclusions drawn from the previous value — variance measured against a PO it no
+ * longer cites — while sitting in a workflow branch chosen because of that variance. Clearing
+ * the variance instead would be worse: the invoice would read as clean while parked in the
+ * not-clean branch. Re-validating is impossible too, since `approvalInstances.invoiceId` is
+ * UNIQUE and there is no supersede/recall model for an in-flight approval.
+ */
+export function correctionBlockedByApproval(params: {
+  revalidates: boolean;
+  hasActiveApproval: boolean;
+}): boolean {
+  return params.revalidates && params.hasActiveApproval;
+}
 
 /** Names of fields sitting below the review threshold, read out of the fieldConfidence blob. */
 function lowConfidenceFieldNames(fieldConfidence: unknown): string[] {
@@ -79,6 +156,7 @@ export class InvoicesService {
     private readonly database: DatabaseService,
     private readonly extraction: ExtractionClientService,
     private readonly workflowEngine: WorkflowEngineService,
+    private readonly vendorsService: VendorsService,
   ) {}
 
   private get db() {
@@ -144,7 +222,9 @@ export class InvoicesService {
     }
 
     const nextStatus = fieldsNeedingReview.length > 0 ? 'NEEDS_REVIEW' : 'VALIDATING';
-    const vendorId = await this.resolveVendor(tenantId, extracted.vendorName.value);
+    // Shared with PO sync so an invoice and its purchase order can't end up pointing at two
+    // different vendor rows for the same company.
+    const vendorId = await this.vendorsService.resolveByName(tenantId, extracted.vendorName.value);
 
     const [updated] = await this.db
       .update(invoices)
@@ -199,28 +279,115 @@ export class InvoicesService {
   }
 
   /**
-   * Upserts the extracted vendor name into `vendors` and returns its id, so the invoice
-   * gets a real `vendorId`. Duplicate detection gates on `vendorId`, so before this
-   * existed that check could never fire.
+   * Re-runs validation on an invoice whose inputs have changed — a corrected PO number, or a
+   * purchase order that has since been synced. Without this, an invoice parked at EXCEPTION
+   * kept stale variance figures forever and there was no way to move it.
    *
-   * Matching is exact-name only. Real vendor resolution needs fuzzy matching plus tax-id
-   * and bank-detail checks — "Acme Inc." and "Acme, Inc" become two vendors here.
+   * Stale state is cleared first: the previous match's variance columns, `purchaseOrderId`
+   * and per-line `poLineNumber` are wiped, and the exceptions the previous run raised are
+   * marked resolved rather than deleted, so the audit trail still shows what was found and
+   * when it stopped applying.
+   *
+   * `force` is for an explicit human request (the endpoint); automatic re-validation after a
+   * correction leaves the confidence gate in place.
    */
-  private async resolveVendor(tenantId: string, vendorName: string | null): Promise<string | null> {
-    const name = vendorName?.trim();
-    if (!name) return null;
+  async revalidate(tenantId: string, invoiceId: string, opts: { force?: boolean } = {}) {
+    const [invoice] = await this.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.id, invoiceId), eq(invoices.tenantId, tenantId)));
+    if (!invoice) throw new NotFoundException('Invoice not found');
+
+    const [existingInstance] = await this.db
+      .select({ id: approvalInstances.id })
+      .from(approvalInstances)
+      .where(eq(approvalInstances.invoiceId, invoiceId));
+
+    const decision = revalidationDecision({
+      status: invoice.status,
+      hasApprovalInstance: Boolean(existingInstance),
+      outstandingReviewFields: await this.outstandingReviewFields(invoiceId, invoice.fieldConfidence),
+      force: opts.force ?? false,
+    });
+
+    if (!decision.proceed) {
+      this.logger.log(`Skipping re-validation of invoice ${invoiceId}: ${decision.reason}`);
+      // Audited, not just logged: a correction that could not be re-checked leaves the
+      // invoice running on the previous validation's conclusions, and that needs to be
+      // visible on the invoice itself rather than only in the server log.
+      await this.logAudit(tenantId, invoiceId, 'REVALIDATION_SKIPPED', {
+        reason: decision.reason,
+        status: invoice.status,
+      });
+      return { revalidated: false, reason: decision.reason, invoice: await this.findOne(tenantId, invoiceId) };
+    }
+
+    await this.clearMatchState(invoiceId);
+
+    const now = new Date();
+    await this.db
+      .update(invoiceExceptions)
+      .set({ resolvedAt: now })
+      .where(and(eq(invoiceExceptions.invoiceId, invoiceId), isNull(invoiceExceptions.resolvedAt)));
+
+    await this.logAudit(tenantId, invoiceId, 'REVALIDATION_STARTED', {
+      previousStatus: invoice.status,
+      forced: opts.force ?? false,
+    });
+
+    await this.runValidation(tenantId, invoiceId);
+
+    const refreshed = await this.findOne(tenantId, invoiceId);
+    await this.logAudit(tenantId, invoiceId, 'REVALIDATION_COMPLETE', { status: refreshed.status });
+
+    return { revalidated: true, reason: decision.reason, invoice: refreshed };
+  }
+
+  /**
+   * Everything still below the confidence threshold, header fields *and* line items.
+   *
+   * Line items matter and are easy to miss: they live in `invoiceLineItems.confidence`, not in
+   * the `fieldConfidence` blob, but they do count toward the NEEDS_REVIEW decision at ingest.
+   * Reading only the blob would let an invoice held solely by a shaky line item slip through.
+   */
+  private async outstandingReviewFields(
+    invoiceId: string,
+    fieldConfidence: unknown,
+  ): Promise<string[]> {
+    const outstanding = lowConfidenceFieldNames(fieldConfidence);
+
+    const lines = await this.db
+      .select({ id: invoiceLineItems.id, confidence: invoiceLineItems.confidence })
+      .from(invoiceLineItems)
+      .where(eq(invoiceLineItems.invoiceId, invoiceId));
+
+    lines.forEach((line, index) => {
+      if (line.confidence !== null && line.confidence < CONFIDENCE_REVIEW_THRESHOLD) {
+        outstanding.push(`lineItems[${index}]`);
+      }
+    });
+
+    return outstanding;
+  }
+
+  /** Wipes the previous match's conclusions so a re-run can't inherit stale variance. */
+  private async clearMatchState(invoiceId: string) {
+    await this.db
+      .update(invoices)
+      .set({
+        purchaseOrderId: null,
+        priceVariancePct: null,
+        quantityVariancePct: null,
+        totalVarianceAmount: null,
+        matchResult: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(invoices.id, invoiceId));
 
     await this.db
-      .insert(vendors)
-      .values({ tenantId, name })
-      .onConflictDoNothing({ target: [vendors.tenantId, vendors.name] });
-
-    const [vendor] = await this.db
-      .select({ id: vendors.id })
-      .from(vendors)
-      .where(and(eq(vendors.tenantId, tenantId), eq(vendors.name, name)));
-
-    return vendor?.id ?? null;
+      .update(invoiceLineItems)
+      .set({ poLineNumber: null })
+      .where(eq(invoiceLineItems.invoiceId, invoiceId));
   }
 
   /**
@@ -464,6 +631,33 @@ export class InvoicesService {
         `Field "${dto.fieldName}" is not correctable. Allowed: ${Object.keys(CORRECTABLE_FIELDS).join(', ')}`,
       );
     }
+
+    // A field that feeds validation cannot be changed once the invoice is in an approval
+    // flow. Accepting it would leave the invoice displaying conclusions drawn from the old
+    // value — e.g. a variance measured against a PO the invoice no longer cites — while it
+    // sits in a workflow branch chosen because of that variance. Re-validating instead is
+    // not possible either: approvalInstances.invoiceId is UNIQUE and there is no
+    // supersede/recall model for an in-flight approval (see CLAUDE.md).
+    if (spec.revalidates) {
+      const [instance] = await this.db
+        .select({ id: approvalInstances.id, completedAt: approvalInstances.completedAt })
+        .from(approvalInstances)
+        .where(eq(approvalInstances.invoiceId, invoiceId));
+
+      const blocked = correctionBlockedByApproval({
+        revalidates: true,
+        hasActiveApproval: Boolean(instance) && !instance?.completedAt,
+      });
+
+      if (blocked) {
+        throw new ConflictException(
+          `"${dto.fieldName}" feeds duplicate and purchase-order matching, so it cannot be changed ` +
+            'while this invoice is in an approval flow — the recorded match would no longer describe ' +
+            'the invoice. Reject the invoice to send it back, or correct it after the approval completes.',
+        );
+      }
+    }
+
     const value = spec.parse(dto.correctedValue);
 
     const fieldConfidence = (invoice.fieldConfidence as Record<string, unknown>) ?? {};
@@ -485,6 +679,19 @@ export class InvoicesService {
 
     // Production: also POST this correction to the extraction service's /feedback
     // endpoint so the per-tenant example set improves for next time.
+
+    // Two independent reasons to re-check after a correction:
+    //  1. the field feeds a validation check, so that check's conclusion is now stale; or
+    //  2. this correction cleared the last thing holding the invoice in review, so it is
+    //     ready to move on even though the field itself feeds no check.
+    // Without (2) an invoice whose final correction was, say, totalAmount would sit in
+    // NEEDS_REVIEW with nothing flagged and no way forward.
+    const outstanding = await this.outstandingReviewFields(invoiceId, fieldConfidence);
+    const clearedLastReviewFlag = invoice.status === 'NEEDS_REVIEW' && outstanding.length === 0;
+
+    if (spec.revalidates || clearedLastReviewFlag) {
+      await this.revalidate(tenantId, invoiceId);
+    }
 
     // Returns the same shape as GET /invoices/:id so a client can swap the response
     // straight into the view it already has.

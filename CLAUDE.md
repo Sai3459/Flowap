@@ -62,7 +62,7 @@ export ANTHROPIC_API_KEY="sk-..."
 #       currencymismatch | nopo | lowamount | inconsistent
 #     The PO scenarios assume this order exists:
 #       PO-5000, Northwind Traders, 20 x "Consulting hours" @ 60.00 USD, received 20
-#     Nothing creates POs yet, so seed it directly (see "Known gaps in PO matching").
+#     Seed it via POST /purchase-orders (see "Purchase order API" below).
 .venv/bin/python -m uvicorn mock_server:app --port 8001
 
 # 4. Frontend (separate terminal)
@@ -172,9 +172,11 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  62 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, and the PO
-  matching functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`).
-  These are the pure functions; anything touching the DB is still only verified by hand.
+  97 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
+  `validatePoPayload`, and the re-validation rules (`revalidationDecision`,
+  `correctionBlockedByApproval`). These are the pure functions; anything touching the DB is
+  still only verified by hand.
 - **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
   on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
   to disable). Escalations now fire without anyone calling the endpoint. Each breach is
@@ -191,6 +193,33 @@ node — there's a regression test for exactly that.
   now fire: `MISSING_PO`, `PO_MISMATCH`, `GRN_MISMATCH`, `CURRENCY_MISMATCH`.
   Verified live across 7 scenarios (clean, within-tolerance, price variance, quantity variance
   + over-receipt, unknown PO, currency mismatch, non-PO).
+- **Purchase order API** — `POST /purchase-orders` (create or re-sync), `GET /purchase-orders`,
+  `GET /purchase-orders/:poNumber`, `POST /purchase-orders/:poNumber/receipts`. Shaped as an
+  **ERP sync**, not an authoring form: `poNumber` is the natural key and re-posting the same PO
+  updates the local copy, so an ERP connector can replay idempotently and the ERP stays the
+  system of record. Vendors are resolved by name through the shared `VendorsService`, so an
+  invoice and its PO cannot end up on two different vendor rows for the same company.
+  `validatePoPayload()` is pure and unit-tested: it rejects a PO whose header total disagrees
+  with its own lines, because such a PO produces phantom total variance on *every* invoice
+  matched to it. The consequence is that freight/surcharges must be modelled as their own PO
+  line — which is also what makes them matchable later.
+- **Goods receipts** are recorded separately (`/receipts`, merging rather than replacing, since
+  partial deliveries land over time). This is what makes the third leg of the 3-way match
+  reachable without raw SQL.
+- **Re-validation** — `revalidate()` clears the previous match's conclusions (variance columns,
+  `purchaseOrderId`, per-line `poLineNumber`), marks the exceptions the previous run raised as
+  `resolvedAt` rather than deleting them, and re-runs `runValidation`. Triggered three ways:
+  automatically when a correction changes a field a check reads (`CORRECTABLE_FIELDS[...]
+  .revalidates` — `invoiceNumber`, `poNumber`, `currency`, `subtotal`); automatically when a
+  correction clears the last field holding an invoice in review; and explicitly via
+  `POST /invoices/:id/revalidate`, which forces past the confidence gate. A late PO sync also
+  re-validates every `EXCEPTION` invoice citing that PO number, so an invoice that arrived
+  before its order clears itself. Verified live end to end for all of these.
+- **Corrections are refused mid-approval** when the field feeds a validation check
+  (409, `correctionBlockedByApproval`). Accepting one would leave the invoice showing variance
+  measured against a PO it no longer cites while parked in a workflow branch chosen because of
+  that variance; clearing the variance instead would make it read as clean in the not-clean
+  branch. Fields that feed no check (dates, reference, tax id) stay correctable throughout.
 - **Two outcomes, deliberately different** (see `runValidation`'s doc comment): *hard stops*
   (duplicate, PO not found, currency mismatch, over-receipt) park at `EXCEPTION` with no
   approval instance; *variances* record an exception **and still start the workflow**, because
@@ -294,12 +323,21 @@ node — there's a regression test for exactly that.
   Pinning the graph (or the `version`) per instance is the safer model.
 
 ### Known gaps in PO matching / master data
-- **Purchase orders are only ever read, never synced.** Nothing creates or updates a
-  `purchaseOrder` — the E2E verification seeded PO-5000 with raw SQL. There is no PO API and no
-  ERP sync, so in practice every real invoice would hit `MISSING_PO`.
-- **The match does not re-run after a correction.** `poNumber` is correctable precisely so a
-  reviewer can fix a `MISSING_PO`, but correcting it does not re-trigger `runPoMatch` — the
-  invoice stays at `EXCEPTION` with stale variance columns. There is no re-validate endpoint.
+- **There is no ERP connector behind the PO API.** POs have to be pushed in by whatever calls
+  `POST /purchase-orders`; nothing pulls them from an ERP on a schedule, and `erpConnections`
+  still has no connector logic. The endpoint is deliberately shaped so a connector can drive
+  it idempotently, but that connector does not exist.
+- **No PO is ever closed or cancelled.** There is no status on `purchaseOrders`, so a fully
+  consumed or cancelled order still matches new invoices exactly as an open one does.
+- **An in-flight invoice cannot be re-validated.** `approvalInstances.invoiceId` is UNIQUE and
+  there is no supersede/recall model, so once an invoice is in an approval flow its match
+  conclusions are frozen. The current answer is to refuse the correction (409) and tell the
+  user to reject the invoice; a proper recall — cancel the instance, keep its audit trail,
+  re-validate, start a fresh one — needs the unique constraint replaced with a
+  current-instance concept.
+- **Re-validation is not transactional.** It clears the match state, resolves exceptions, then
+  re-runs validation as separate statements; a crash midway leaves the invoice with its old
+  exceptions resolved and no new match.
 - **Line pairing is exact-normalised-description then positional.** No fuzzy matching, no
   part-number matching (invoice lines have no part number field). Positional fallback will
   mis-pair a multi-line invoice whose ordering differs from the PO.
@@ -333,6 +371,14 @@ node — there's a regression test for exactly that.
   the copies can drift out of sync with no test to catch it.
 - **No pagination, filtering, or sorting** on the invoice list — it renders every invoice
   the tenant has in one table.
+- **Purchase orders are API-only in the UI.** The detail screen shows the *match* against a PO,
+  but there is no screen to list, inspect or create purchase orders and no way to record a
+  goods receipt from the frontend — those go through `POST /purchase-orders` and
+  `/receipts` by hand.
+- **Nothing surfaces the re-validate action.** `POST /invoices/:id/revalidate` exists (the only
+  route out for an invoice held by a low-confidence *line item*, since line items still aren't
+  correctable) but no button calls it, and the 409 refusal on a mid-approval correction has no
+  UI affordance explaining it.
 - **`vendorName` is shown with a confidence score but is not editable**, because correcting
   it means re-linking a `Vendor` row rather than writing a column. It's the one field on the
   detail screen with a confidence and no Edit affordance.

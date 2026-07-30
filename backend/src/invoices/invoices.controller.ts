@@ -39,4 +39,15 @@ export class InvoicesController {
   ) {
     return this.invoicesService.correctField(tenantId, id, dto);
   }
+
+  /**
+   * Explicitly re-run duplicate detection and PO matching. Corrections to validation-relevant
+   * fields already trigger this automatically; this endpoint is for the cases they don't cover
+   * — notably releasing an invoice held by a low-confidence line item, which is why it forces
+   * past the confidence gate.
+   */
+  @Post(':id/revalidate')
+  revalidate(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+    return this.invoicesService.revalidate(tenantId, id, { force: true });
+  }
 }

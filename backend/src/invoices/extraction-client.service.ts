@@ -5,12 +5,27 @@ export interface ExtractedField<T = string> {
   confidence: number; // 0..1
 }
 
+export interface ExtractedBankDetails {
+  iban: string | null;
+  accountNumber: string | null;
+  bic: string | null;
+  bankName: string | null;
+}
+
 export interface ExtractionResult {
   invoiceNumber: ExtractedField;
+  /** As printed on the invoice; may not resolve to a real PO. */
+  poNumber: ExtractedField;
+  referenceNumber: ExtractedField;
   invoiceDate: ExtractedField;
   dueDate: ExtractedField;
+  /** Delivery/service date — often differs from invoiceDate and drives tax treatment. */
+  supplyDate: ExtractedField;
   currency: ExtractedField;
   vendorName: ExtractedField;
+  vendorTaxId: ExtractedField;
+  /** Remittance details claimed on the document, for comparison against vendor master. */
+  bankDetails: ExtractedField<ExtractedBankDetails>;
   subtotal: ExtractedField<number>;
   taxAmount: ExtractedField<number>;
   totalAmount: ExtractedField<number>;
@@ -19,6 +34,8 @@ export interface ExtractionResult {
     quantity: number;
     unitPrice: number;
     lineTotal: number;
+    taxCode: string | null;
+    taxRate: number | null;
     confidence: number;
   }[];
   documentType: ExtractedField; // e.g. INVOICE | CREDIT_NOTE | RECEIPT
@@ -51,18 +68,44 @@ export class ExtractionClientService {
     return (await res.json()) as ExtractionResult;
   }
 
-  /** Returns names of fields that fell below the confidence threshold. */
+  /**
+   * Returns names of fields that fell below the confidence threshold.
+   *
+   * Required vs optional matters here. The extractor reports confidence 0.0 for a field
+   * that is genuinely absent from the document, so treating every field as required would
+   * push every non-PO invoice into review for lacking a PO number. An optional field is
+   * only flagged when it *has* a value the extractor was unsure about; a missing required
+   * field is always worth a human.
+   */
   static fieldsNeedingReview(result: ExtractionResult): string[] {
-    const flat: [string, number][] = [
-      ['invoiceNumber', result.invoiceNumber.confidence],
-      ['invoiceDate', result.invoiceDate.confidence],
-      ['currency', result.currency.confidence],
-      ['vendorName', result.vendorName.confidence],
-      ['subtotal', result.subtotal.confidence],
-      ['taxAmount', result.taxAmount.confidence],
-      ['totalAmount', result.totalAmount.confidence],
+    const required: [string, ExtractedField<unknown>][] = [
+      ['invoiceNumber', result.invoiceNumber],
+      ['invoiceDate', result.invoiceDate],
+      ['currency', result.currency],
+      ['vendorName', result.vendorName],
+      ['subtotal', result.subtotal],
+      ['taxAmount', result.taxAmount],
+      ['totalAmount', result.totalAmount],
     ];
-    const low = flat.filter(([, c]) => c < CONFIDENCE_REVIEW_THRESHOLD).map(([n]) => n);
+    const optional: [string, ExtractedField<unknown>][] = [
+      ['poNumber', result.poNumber],
+      ['referenceNumber', result.referenceNumber],
+      ['dueDate', result.dueDate],
+      ['supplyDate', result.supplyDate],
+      ['vendorTaxId', result.vendorTaxId],
+      ['bankDetails', result.bankDetails],
+    ];
+
+    const low = required
+      .filter(([, f]) => f.confidence < CONFIDENCE_REVIEW_THRESHOLD)
+      .map(([name]) => name);
+
+    for (const [name, field] of optional) {
+      if (field?.value !== null && field?.value !== undefined && field.confidence < CONFIDENCE_REVIEW_THRESHOLD) {
+        low.push(name);
+      }
+    }
+
     result.lineItems.forEach((li, i) => {
       if (li.confidence < CONFIDENCE_REVIEW_THRESHOLD) low.push(`lineItems[${i}]`);
     });

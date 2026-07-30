@@ -23,13 +23,17 @@ export function formatConfidence(meta: FieldConfidence | undefined): string {
 /** Human-readable labels for the extracted header fields, in the order the UI shows them. */
 export const FIELD_LABELS: Record<string, string> = {
   invoiceNumber: 'Invoice number',
+  poNumber: 'PO number',
+  referenceNumber: 'Reference',
   vendorName: 'Vendor',
+  vendorTaxId: 'Vendor tax ID',
   invoiceDate: 'Invoice date',
   dueDate: 'Due date',
+  supplyDate: 'Supply date',
   currency: 'Currency',
-  subtotal: 'Subtotal',
+  subtotal: 'Subtotal (net)',
   taxAmount: 'Tax',
-  totalAmount: 'Total',
+  totalAmount: 'Total (gross)',
 };
 
 /**
@@ -39,14 +43,18 @@ export const FIELD_LABELS: Record<string, string> = {
  */
 export const CORRECTABLE_FIELDS = new Set([
   'invoiceNumber',
+  'poNumber',
+  'referenceNumber',
+  'vendorTaxId',
   'currency',
   'invoiceDate',
   'dueDate',
+  'supplyDate',
   'subtotal',
   'taxAmount',
   'totalAmount',
 ]);
 
 /** Which fields render as a date input vs. plain text, matching the backend's parsers. */
-export const DATE_FIELDS = new Set(['invoiceDate', 'dueDate']);
+export const DATE_FIELDS = new Set(['invoiceDate', 'dueDate', 'supplyDate']);
 export const MONEY_FIELDS = new Set(['subtotal', 'taxAmount', 'totalAmount']);

@@ -20,6 +20,34 @@ function formatDate(value: string | null): string {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString().slice(0, 10);
 }
 
+/**
+ * PO-match state for a list row. Distinguishes "no PO to match against" from "matched
+ * cleanly" — an empty cell for a non-PO invoice would otherwise read as an unrun check.
+ */
+function VarianceIndicator({
+  poNumber,
+  priceVariancePct,
+  quantityVariancePct,
+}: {
+  poNumber: string | null;
+  priceVariancePct: number | null;
+  quantityVariancePct: number | null;
+}) {
+  if (!poNumber) return <span className="subtle">n/a</span>;
+
+  const worst = [priceVariancePct, quantityVariancePct].filter(
+    (v): v is number => v !== null && v > 0,
+  );
+  if (worst.length === 0) return <span className="badge badge-ok">in tolerance</span>;
+
+  const label = quantityVariancePct && quantityVariancePct > 0 ? 'qty' : 'price';
+  return (
+    <span className="badge badge-warn">
+      {label} +{Math.max(...worst).toFixed(1)}%
+    </span>
+  );
+}
+
 export function InvoiceListPage() {
   const navigate = useNavigate();
   const { data, loading, error } = useApi<InvoiceListItem[]>(() => api.listInvoices());
@@ -52,11 +80,13 @@ export function InvoiceListPage() {
             <thead>
               <tr>
                 <th>Invoice #</th>
+                <th>PO</th>
                 <th>Vendor</th>
                 <th>Date</th>
                 <th className="num">Amount</th>
                 <th>Status</th>
                 <th>Confidence</th>
+                <th>PO match</th>
                 <th>Source</th>
               </tr>
             </thead>
@@ -68,6 +98,7 @@ export function InvoiceListPage() {
                   onClick={() => navigate(`/invoices/${invoice.id}`)}
                 >
                   <td>{invoice.invoiceNumber ?? <span className="subtle">—</span>}</td>
+                  <td className="subtle">{invoice.poNumber ?? 'non-PO'}</td>
                   <td>{invoice.vendorName ?? <span className="subtle">unresolved</span>}</td>
                   <td>{formatDate(invoice.invoiceDate)}</td>
                   <td className="num">{formatMoney(invoice.totalAmount, invoice.currency)}</td>
@@ -76,6 +107,13 @@ export function InvoiceListPage() {
                   </td>
                   <td>
                     <ConfidenceIndicator lowConfidenceFields={invoice.lowConfidenceFields} />
+                  </td>
+                  <td>
+                    <VarianceIndicator
+                      poNumber={invoice.poNumber}
+                      priceVariancePct={invoice.priceVariancePct}
+                      quantityVariancePct={invoice.quantityVariancePct}
+                    />
                   </td>
                   <td className="subtle">{invoice.sourceChannel}</td>
                 </tr>

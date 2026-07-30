@@ -4,14 +4,19 @@ import type { InvoiceDetail } from '../api/types';
 import { StatusBadge } from '../components/Badges';
 import { FieldRow } from '../components/FieldRow';
 import { ExceptionBlock } from '../components/ExceptionBlock';
+import { MatchPanel } from '../components/MatchPanel';
 import { confidenceLevel } from '../lib/confidence';
 import { useApi } from '../lib/useApi';
 
 /** Display order for header fields; anything unexpected in fieldConfidence is appended. */
 const FIELD_ORDER = [
   'invoiceNumber',
+  'poNumber',
+  'referenceNumber',
   'vendorName',
+  'vendorTaxId',
   'invoiceDate',
+  'supplyDate',
   'dueDate',
   'currency',
   'subtotal',
@@ -94,6 +99,10 @@ export function InvoiceDetailPage() {
         </div>
       </div>
 
+      {invoice.matchResult && (
+        <MatchPanel match={invoice.matchResult} poNumber={invoice.poNumber} />
+      )}
+
       <div className="card">
         <h2>Line items</h2>
         {invoice.lineItems.length === 0 ? (
@@ -107,6 +116,8 @@ export function InvoiceDetailPage() {
                   <th className="num">Qty</th>
                   <th className="num">Unit price</th>
                   <th className="num">Line total</th>
+                  <th>Tax code</th>
+                  <th>PO line</th>
                   <th>GL code</th>
                   <th className="num">Confidence</th>
                 </tr>
@@ -120,6 +131,11 @@ export function InvoiceDetailPage() {
                       <td className="num">{trimNumber(item.quantity)}</td>
                       <td className="num">{trimNumber(item.unitPrice)}</td>
                       <td className="num">{item.lineTotal}</td>
+                      <td className="subtle">
+                        {item.taxCode ?? '—'}
+                        {item.taxRate !== null && ` (${item.taxRate}%)`}
+                      </td>
+                      <td className="subtle">{item.poLineNumber ?? '—'}</td>
                       <td className="subtle">{item.glCode ?? 'unassigned'}</td>
                       <td className="num">
                         {item.confidence === null ? (

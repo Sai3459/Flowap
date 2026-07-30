@@ -31,6 +31,7 @@ export interface InvoiceListItem {
   id: string;
   status: InvoiceStatus;
   invoiceNumber: string | null;
+  poNumber: string | null;
   invoiceDate: string | null;
   currency: string | null;
   totalAmount: string | null;
@@ -38,6 +39,39 @@ export interface InvoiceListItem {
   createdAt: string;
   vendorName: string | null;
   lowConfidenceFields: string[];
+  /** Worst overbill across lines, from PO matching. Null when there was no PO to match. */
+  priceVariancePct: number | null;
+  quantityVariancePct: number | null;
+}
+
+export type LineMatchStatus =
+  | 'MATCHED'
+  | 'PRICE_VARIANCE'
+  | 'QUANTITY_VARIANCE'
+  | 'OVER_RECEIPT'
+  | 'UNMATCHED';
+
+export interface LineMatch {
+  invoiceLineId: string;
+  description: string;
+  poLineNumber: number | null;
+  status: LineMatchStatus;
+  priceVariancePct: number | null;
+  quantityVariancePct: number | null;
+  billedQuantity: number;
+  orderedQuantity: number | null;
+  receivedQuantity: number | null;
+  explanation: string | null;
+}
+
+/** `invoices.matchResult` — the detail behind the flat variance columns. */
+export interface PoMatchResult {
+  maxPriceVariancePct: number | null;
+  maxQuantityVariancePct: number | null;
+  totalVarianceAmount: number | null;
+  lines: LineMatch[];
+  isClean: boolean;
+  headerIssues: string[];
 }
 
 export interface LineItem {
@@ -47,9 +81,13 @@ export interface LineItem {
   quantity: string;
   unitPrice: string;
   lineTotal: string;
+  taxCode: string | null;
+  taxRate: number | null;
   glCode: string | null;
   glCodeSource: FieldSource | null;
   confidence: number | null;
+  /** PO line this was matched to, once matching has run. */
+  poLineNumber: number | null;
 }
 
 export interface InvoiceException {
@@ -71,13 +109,23 @@ export interface InvoiceDetail {
   status: InvoiceStatus;
   sourceChannel: string;
   fileUrl: string;
+  documentType: string | null;
   invoiceNumber: string | null;
+  /** As printed on the document; may not resolve to a real PO (see MISSING_PO). */
+  poNumber: string | null;
+  referenceNumber: string | null;
   invoiceDate: string | null;
   dueDate: string | null;
+  supplyDate: string | null;
   currency: string | null;
   subtotal: string | null;
   taxAmount: string | null;
   totalAmount: string | null;
+  vendorTaxId: string | null;
+  priceVariancePct: number | null;
+  quantityVariancePct: number | null;
+  totalVarianceAmount: string | null;
+  matchResult: PoMatchResult | null;
   fieldConfidence: FieldConfidenceMap | null;
   createdAt: string;
   updatedAt: string;

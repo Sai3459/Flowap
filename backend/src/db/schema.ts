@@ -37,6 +37,12 @@ export const approvalStepStatusEnum = pgEnum('approval_step_status', [
 export const tenants = pgTable('tenants', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
+  /**
+   * Per-tenant PO-matching tolerances, overriding DEFAULT_MATCH_TOLERANCES in
+   * `matching/po-matching.ts`. Null means use the defaults. Shape:
+   * { pricePct, quantityPct, totalAmountAbs, blockOnOverReceipt }
+   */
+  matchTolerances: jsonb('match_tolerances'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -76,7 +82,17 @@ export const purchaseOrders = pgTable('purchase_orders', {
   poNumber: text('po_number').notNull(),
   totalAmount: numeric('total_amount', { precision: 18, scale: 2 }).notNull(),
   currency: text('currency').notNull(),
+  /**
+   * PoLineItem[] — see `matching/po-matching.types.ts`:
+   * [{ lineNumber, description, quantity, unitPrice, lineTotal, unit? }]
+   * In production these are synced from the ERP, which stays the system of record.
+   */
   lineItems: jsonb('line_items').notNull(),
+  /**
+   * Goods-receipt quantities keyed by PO line number: { "1": 20, "2": 5 }.
+   * Absent entirely = no receipt recorded, which is what makes the 3-way match
+   * distinguishable from a genuine zero receipt.
+   */
   receivedQty: jsonb('received_qty'),
 }, (t) => ({
   tenantPoUnique: unique().on(t.tenantId, t.poNumber),
@@ -93,16 +109,39 @@ export const invoices = pgTable('invoices', {
   sourceChannel: text('source_channel').notNull(),
   fileUrl: text('file_url').notNull(),
 
+  documentType: text('document_type'), // INVOICE | CREDIT_NOTE | RECEIPT | UNKNOWN, as extracted
+
   invoiceNumber: text('invoice_number'),
+  // The PO number as printed on the invoice. Kept separate from purchaseOrderId: this is
+  // what the vendor *claims*, which may not resolve to a real order — the difference
+  // between the two is what MISSING_PO reports.
+  poNumber: text('po_number'),
+  referenceNumber: text('reference_number'), // vendor's own ref: delivery note, contract
   invoiceDate: timestamp('invoice_date'),
   dueDate: timestamp('due_date'),
+  supplyDate: timestamp('supply_date'), // delivery/service date; governs tax treatment
   currency: text('currency'),
   subtotal: numeric('subtotal', { precision: 18, scale: 2 }),
   taxAmount: numeric('tax_amount', { precision: 18, scale: 2 }),
   totalAmount: numeric('total_amount', { precision: 18, scale: 2 }),
 
+  // Claimed on the document, to be compared against vendor master data. Deliberately not
+  // written back to `vendors` — a mismatch is a fraud signal, not a master-data update.
+  vendorTaxId: text('vendor_tax_id'),
+  bankDetails: jsonb('bank_details'),
+
   // { "invoiceNumber": { "confidence": 0.97, "source": "AI_EXTRACTED" }, ... }
   fieldConfidence: jsonb('field_confidence'),
+
+  // --- PO match results ---
+  // Flat numerics rather than only jsonb, because workflow CONDITION nodes evaluate a
+  // numeric column on this row: keeping variance here means variance-based approval
+  // routing works through the existing engine with no changes to the evaluator.
+  priceVariancePct: real('price_variance_pct'),
+  quantityVariancePct: real('quantity_variance_pct'),
+  totalVarianceAmount: numeric('total_variance_amount', { precision: 18, scale: 2 }),
+  // Per-line detail and the human-readable explanation behind the numbers above.
+  matchResult: jsonb('match_result'),
 
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -118,9 +157,13 @@ export const invoiceLineItems = pgTable('invoice_line_items', {
   quantity: numeric('quantity', { precision: 18, scale: 4 }).notNull(),
   unitPrice: numeric('unit_price', { precision: 18, scale: 4 }).notNull(),
   lineTotal: numeric('line_total', { precision: 18, scale: 2 }).notNull(),
+  taxCode: text('tax_code'),
+  taxRate: real('tax_rate'), // percentage, e.g. 19.0
   glCode: text('gl_code'),
   glCodeSource: fieldSourceEnum('gl_code_source'),
   confidence: real('confidence'),
+  /** Which PO line this was matched to, once PO matching has run. Null = unmatched. */
+  poLineNumber: integer('po_line_number'),
 }, (t) => ({
   invoiceIdx: index('line_items_invoice_idx').on(t.invoiceId),
 }));

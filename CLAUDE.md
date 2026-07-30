@@ -56,9 +56,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 export ANTHROPIC_API_KEY="sk-..."
 .venv/bin/python -m uvicorn main:app --port 8001
 
-# 3b. …or the mock, which needs no API key and is what the E2E checks above ran against.
-#     Serves a clean invoice ($1296), a low-amount one (url contains "lowamount", $486),
-#     and a deliberately inconsistent one (url contains "inconsistent").
+# 3b. …or the mock, which needs no API key and is what every E2E check has run against.
+#     Scenarios are chosen by a token in the requested file_url — GET /health lists them:
+#       cleanpo | withintolerance | pricevariance | qtyvariance | unknownpo
+#       currencymismatch | nopo | lowamount | inconsistent
+#     The PO scenarios assume this order exists:
+#       PO-5000, Northwind Traders, 20 x "Consulting hours" @ 60.00 USD, received 20
+#     Nothing creates POs yet, so seed it directly (see "Known gaps in PO matching").
 .venv/bin/python -m uvicorn mock_server:app --port 8001
 
 # 4. Frontend (separate terminal)
@@ -168,14 +172,43 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  29 tests covering `resolveNodeOutcome`, `evaluateCondition`, and `validateGraph`. These
-  are the pure graph functions; anything touching the DB is still only verified by hand.
+  62 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, and the PO
+  matching functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`).
+  These are the pure functions; anything touching the DB is still only verified by hand.
 - **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
   on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
   to disable). Escalations now fire without anyone calling the endpoint. Each breach is
   reported once via the `approvalSteps.slaBreachedAt` stamp — before that existed, a node
   with no `onSlaBreach` edge re-logged a breach on every tick forever. Verified live with a
   1-minute cron: one audit row across multiple ticks, step left PENDING but not re-fired.
+- **PO matching (2- and 3-way) with variance routing** — `src/matching/po-matching.ts` is pure
+  and unit-tested; `runPoMatch()` in `invoices.service.ts` wires it into `runValidation()`.
+  Extraction now returns `poNumber`, so the PO is resolved by `(tenantId, poNumber)`, lines are
+  paired to PO lines (normalised description, positional fallback, each PO line claimed once),
+  and price/quantity/net-total variance is computed against per-tenant tolerances
+  (`tenants.matchTolerances`, defaults in `DEFAULT_MATCH_TOLERANCES`). Goods receipt
+  (`purchaseOrders.receivedQty`) drives the third way. All the previously-unused exception types
+  now fire: `MISSING_PO`, `PO_MISMATCH`, `GRN_MISMATCH`, `CURRENCY_MISMATCH`.
+  Verified live across 7 scenarios (clean, within-tolerance, price variance, quantity variance
+  + over-receipt, unknown PO, currency mismatch, non-PO).
+- **Two outcomes, deliberately different** (see `runValidation`'s doc comment): *hard stops*
+  (duplicate, PO not found, currency mismatch, over-receipt) park at `EXCEPTION` with no
+  approval instance; *variances* record an exception **and still start the workflow**, because
+  a price overrun is a decision someone is allowed to approve.
+- **Variance-based approval routing, with no engine change** — variance is persisted to flat
+  numeric columns (`priceVariancePct`, `quantityVariancePct`, `totalVarianceAmount`) precisely
+  because `CONDITION` nodes evaluate a numeric column on the invoice row. A graph branching on
+  `priceVariancePct > 5` therefore works through the existing evaluator. Verified live: a 15%
+  price variance routed to the CONTROLLER while a clean invoice took the default edge to
+  AP_MANAGER. `matchResult` (jsonb) carries the per-line detail and explanations.
+- **Richer extraction** — `poNumber`, `referenceNumber`, `supplyDate` (delivery/service date,
+  which governs tax treatment), `vendorTaxId`, `bankDetails`, persisted `documentType`, and
+  per-line `taxCode`/`taxRate`. `vendorTaxId`/`bankDetails` are stored as *claimed on the
+  document* and deliberately never written back to `vendors` — the difference between claim and
+  master is the fraud signal.
+  `fieldsNeedingReview` distinguishes required from optional fields, so an absent optional
+  field (confidence 0.0 because it isn't on the document) no longer drags every non-PO invoice
+  into review.
 - **Vendor resolution on ingest** — `resolveVendor()` upserts the extracted `vendorName` into
   `vendors` (unique on `tenantId+name`) and sets `invoices.vendorId`. This also switched
   **duplicate detection on for the first time**: it gates on `vendorId`, which nothing had
@@ -210,9 +243,12 @@ node — there's a regression test for exactly that.
    accidental decisions; it is not authorization until the id comes from a session. When
    this lands, `assertIsAssignedApprover` should read the session subject instead — the
    check itself doesn't need to move.
-2. **PO / goods-receipt matching** — `PurchaseOrder` table exists; no matching logic yet.
-   `runValidation()` in `invoices.service.ts` is where this plugs in, next to the existing
-   duplicate check.
+2. **Posting after approval** — an approved invoice currently just sits at `APPROVED` and
+   stops. `POSTED`/`PAID` exist in the status enum with nothing setting them, and
+   `erpConnections` stores connector config with no connector logic behind it. This is the
+   biggest remaining functional hole: the tool cannot yet hand anything back to the ERP.
+   Target shape is push-to-ERP storing the returned ERP document number — the ERP stays the
+   system of record (design decision 5), so this tool must not become the ledger.
 3. **Approvals in the UI** — the three review screens exist, but nothing in the frontend
    touches the workflow engine. No approve/reject/delegate view, no overdue dashboard, no
    mobile approval screen. `GET /approvals/:invoiceId` and the decide/delegate endpoints are
@@ -257,6 +293,31 @@ node — there's a regression test for exactly that.
   graph edited underneath an in-flight instance changes that instance's remaining path.
   Pinning the graph (or the `version`) per instance is the safer model.
 
+### Known gaps in PO matching / master data
+- **Purchase orders are only ever read, never synced.** Nothing creates or updates a
+  `purchaseOrder` — the E2E verification seeded PO-5000 with raw SQL. There is no PO API and no
+  ERP sync, so in practice every real invoice would hit `MISSING_PO`.
+- **The match does not re-run after a correction.** `poNumber` is correctable precisely so a
+  reviewer can fix a `MISSING_PO`, but correcting it does not re-trigger `runPoMatch` — the
+  invoice stays at `EXCEPTION` with stale variance columns. There is no re-validate endpoint.
+- **Line pairing is exact-normalised-description then positional.** No fuzzy matching, no
+  part-number matching (invoice lines have no part number field). Positional fallback will
+  mis-pair a multi-line invoice whose ordering differs from the PO.
+- **Tax is checked arithmetically, not against tax codes.** `taxCode`/`taxRate` are extracted
+  and stored but nothing validates them, so `TAX_MISMATCH` is still unused. Only one header tax
+  total is modelled — an invoice with several tax rates loses that breakdown.
+- **`vendorTaxId` and `bankDetails` are captured but not compared** against `vendors.taxId` /
+  `vendors.bankDetails`, which are still never populated. The data needed for `FRAUD_RISK` is
+  now there; the comparison is not written.
+- **Partial and repeat billing against one PO is not tracked.** Matching compares each invoice
+  against the full PO independently, so two invoices each billing half an order both look like
+  50% under-billings, and billing the same PO twice in full is not detected as over-consumption.
+- **No credit-note handling.** `documentType` is stored but not acted on; a CREDIT_NOTE is
+  matched as though it were an invoice.
+- **Variance invoices do not appear in the review queue.** The queue filters on *status*, and a
+  variance invoice deliberately sits at `PENDING_APPROVAL`, so an open `PO_MISMATCH` is only
+  visible on the detail screen. An "open exceptions" view independent of status is missing.
+
 ### Known gaps in the frontend
 - **No tests at all.** Verified by driving a real browser against the running API, not by
   anything repeatable. No component tests, no e2e suite.
@@ -278,6 +339,13 @@ node — there's a regression test for exactly that.
 - **Vendor matching is exact-name.** `resolveVendor()` does no normalisation, so
   "Acme Inc." and "Acme, Inc" become two vendors — and duplicate detection, which keys on
   `vendorId`, won't see invoices from those two as related.
+
+### Inbound is still one endpoint
+`POST /invoices` with a `fileUrl` is the only way in. `sourceChannel` accepts EMAIL/PORTAL/
+MOBILE/etc. but it is **just a label the caller passes** — there is no mailbox listener, no
+vendor portal, no upload screen. The extraction service does fetch the URL and base64 it for
+Claude vision (`main.py`), so the real path is coded, but it has only ever been exercised
+against `mock_server.py`: no real PDF and no real `ANTHROPIC_API_KEY` has been through it.
 
 ## Conventions
 - Tenant ID always comes first in service method signatures: `(tenantId, ...)`.

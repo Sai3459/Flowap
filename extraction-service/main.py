@@ -43,19 +43,41 @@ For every field, provide your own confidence (0.0-1.0) based on how legible and 
 the source text was — not how confident you feel in general. If a field is genuinely absent \
 from the document, return null for the value and 0.0 for confidence rather than guessing.
 
+Field notes:
+- poNumber: the purchase order the vendor is billing against. Vendors label this many ways \
+("PO", "P.O. No", "Order Number", "Your reference", "Bestellnummer"). Return the PO \
+identifier only, stripped of any label text. Null if the invoice references no order.
+- referenceNumber: the vendor's own document reference when it is distinct from the invoice \
+number (delivery note number, contract number, customer reference).
+- supplyDate: the date goods were delivered or the service was performed, which is often \
+different from the invoice date and is the date that governs tax treatment. Look for \
+"delivery date", "service period", "supply date", "performance date". If a period is given, \
+return its end date.
+- vendorTaxId: the supplier's VAT / tax registration number. Do NOT return the buyer's.
+- bankDetails: the remittance bank details printed on the invoice. Extract exactly as \
+printed — these get compared against vendor master data to catch payment fraud, so a \
+"corrected" guess is worse than null.
+- lineItems[].taxCode / taxRate: the per-line tax code and percentage rate if shown \
+(e.g. "V1", 19.0). Null when the invoice only states tax at the header level.
+
 Respond with ONLY a single JSON object, no prose, matching exactly this shape:
 {
   "documentType": {"value": "INVOICE|CREDIT_NOTE|RECEIPT|UNKNOWN", "confidence": 0.0},
   "invoiceNumber": {"value": string|null, "confidence": 0.0},
+  "poNumber": {"value": string|null, "confidence": 0.0},
+  "referenceNumber": {"value": string|null, "confidence": 0.0},
   "invoiceDate": {"value": "YYYY-MM-DD"|null, "confidence": 0.0},
   "dueDate": {"value": "YYYY-MM-DD"|null, "confidence": 0.0},
+  "supplyDate": {"value": "YYYY-MM-DD"|null, "confidence": 0.0},
   "currency": {"value": "ISO 4217 code"|null, "confidence": 0.0},
   "vendorName": {"value": string|null, "confidence": 0.0},
+  "vendorTaxId": {"value": string|null, "confidence": 0.0},
+  "bankDetails": {"value": {"iban": string|null, "accountNumber": string|null, "bic": string|null, "bankName": string|null}|null, "confidence": 0.0},
   "subtotal": {"value": number|null, "confidence": 0.0},
   "taxAmount": {"value": number|null, "confidence": 0.0},
   "totalAmount": {"value": number|null, "confidence": 0.0},
   "lineItems": [
-    {"description": string, "quantity": number, "unitPrice": number, "lineTotal": number, "confidence": 0.0}
+    {"description": string, "quantity": number, "unitPrice": number, "lineTotal": number, "taxCode": string|null, "taxRate": number|null, "confidence": 0.0}
   ]
 }"""
 

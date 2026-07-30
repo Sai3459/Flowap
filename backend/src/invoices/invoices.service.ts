@@ -6,8 +6,12 @@ import {
   invoiceLineItems,
   invoiceExceptions,
   auditEvents,
+  purchaseOrders,
+  tenants,
   vendors,
 } from '../db/schema';
+import { matchInvoiceToPo, resolveTolerances } from '../matching/po-matching';
+import type { PoLineItem, PoMatchResult } from '../matching/po-matching.types';
 import {
   CONFIDENCE_REVIEW_THRESHOLD,
   ExtractionClientService,
@@ -26,9 +30,15 @@ import { WorkflowEngineService } from '../workflow/workflow-engine.service';
  */
 const CORRECTABLE_FIELDS: Record<string, { parse: (raw: string) => unknown }> = {
   invoiceNumber: { parse: (raw) => raw.trim() },
+  // Correcting the PO number is the main way a reviewer resolves a MISSING_PO exception,
+  // so it has to be editable. Note the match does not automatically re-run on correction.
+  poNumber: { parse: (raw) => raw.trim() },
+  referenceNumber: { parse: (raw) => raw.trim() },
+  vendorTaxId: { parse: (raw) => raw.trim() },
   currency: { parse: (raw) => raw.trim().toUpperCase() },
   invoiceDate: { parse: (raw) => parseDateOrThrow(raw, 'invoiceDate') },
   dueDate: { parse: (raw) => parseDateOrThrow(raw, 'dueDate') },
+  supplyDate: { parse: (raw) => parseDateOrThrow(raw, 'supplyDate') },
   subtotal: { parse: (raw) => parseMoneyOrThrow(raw, 'subtotal') },
   taxAmount: { parse: (raw) => parseMoneyOrThrow(raw, 'taxAmount') },
   totalAmount: { parse: (raw) => parseMoneyOrThrow(raw, 'totalAmount') },
@@ -112,6 +122,9 @@ export class InvoicesService {
 
     const fieldsNeedingReview = ExtractionClientService.fieldsNeedingReview(extracted);
 
+    // Only fields that were actually present get a confidence entry. Writing one for an
+    // absent optional field would show the review UI a 0%-confidence row for something the
+    // document simply doesn't have.
     const fieldConfidence: Record<string, { confidence: number; source: string }> = {
       invoiceNumber: { confidence: extracted.invoiceNumber.confidence, source: 'AI_EXTRACTED' },
       invoiceDate: { confidence: extracted.invoiceDate.confidence, source: 'AI_EXTRACTED' },
@@ -123,6 +136,12 @@ export class InvoicesService {
       taxAmount: { confidence: extracted.taxAmount.confidence, source: 'AI_EXTRACTED' },
       totalAmount: { confidence: extracted.totalAmount.confidence, source: 'AI_EXTRACTED' },
     };
+    for (const name of ['poNumber', 'referenceNumber', 'dueDate', 'supplyDate', 'vendorTaxId'] as const) {
+      const field = extracted[name];
+      if (field?.value !== null && field?.value !== undefined) {
+        fieldConfidence[name] = { confidence: field.confidence, source: 'AI_EXTRACTED' };
+      }
+    }
 
     const nextStatus = fieldsNeedingReview.length > 0 ? 'NEEDS_REVIEW' : 'VALIDATING';
     const vendorId = await this.resolveVendor(tenantId, extracted.vendorName.value);
@@ -130,12 +149,19 @@ export class InvoicesService {
     const [updated] = await this.db
       .update(invoices)
       .set({
+        documentType: extracted.documentType.value ?? undefined,
         invoiceNumber: extracted.invoiceNumber.value ?? undefined,
+        poNumber: extracted.poNumber.value ?? undefined,
+        referenceNumber: extracted.referenceNumber.value ?? undefined,
         invoiceDate: extracted.invoiceDate.value ? new Date(extracted.invoiceDate.value) : undefined,
+        dueDate: extracted.dueDate.value ? new Date(extracted.dueDate.value) : undefined,
+        supplyDate: extracted.supplyDate.value ? new Date(extracted.supplyDate.value) : undefined,
         currency: extracted.currency.value ?? undefined,
         subtotal: extracted.subtotal.value?.toString(),
         taxAmount: extracted.taxAmount.value?.toString(),
         totalAmount: extracted.totalAmount.value?.toString(),
+        vendorTaxId: extracted.vendorTaxId.value ?? undefined,
+        bankDetails: extracted.bankDetails.value ?? undefined,
         vendorId: vendorId ?? undefined,
         fieldConfidence,
         status: nextStatus,
@@ -152,6 +178,8 @@ export class InvoicesService {
           quantity: li.quantity.toString(),
           unitPrice: li.unitPrice.toString(),
           lineTotal: li.lineTotal.toString(),
+          taxCode: li.taxCode ?? undefined,
+          taxRate: li.taxRate ?? undefined,
           confidence: li.confidence,
           glCodeSource: 'AI_EXTRACTED' as const,
         })),
@@ -195,7 +223,18 @@ export class InvoicesService {
     return vendor?.id ?? null;
   }
 
-  /** Duplicate detection today; PO/GRN matching and fraud scoring plug in here next. */
+  /**
+   * Pre-approval checks. Two distinct outcomes, deliberately:
+   *
+   * - **Hard stops** park the invoice at EXCEPTION with no approval instance, because no
+   *   amount of approving makes them right: a duplicate, a PO that doesn't exist, a
+   *   currency that disagrees with the order, or billing more than was received.
+   * - **Variances** record an exception *and still start the workflow*, with the variance
+   *   figures written to the invoice so CONDITION nodes can route on them. A price overrun
+   *   is a business decision someone is allowed to approve, not a data error.
+   *
+   * Fraud scoring plugs in here next, alongside the PO match.
+   */
   private async runValidation(tenantId: string, invoiceId: string) {
     const [invoice] = await this.db.select().from(invoices).where(eq(invoices.id, invoiceId));
     if (!invoice) throw new NotFoundException('Invoice not found');
@@ -229,6 +268,16 @@ export class InvoicesService {
       }
     }
 
+    const matchOutcome = await this.runPoMatch(tenantId, invoice);
+    if (matchOutcome === 'BLOCKED') {
+      const [blocked] = await this.db
+        .update(invoices)
+        .set({ status: 'EXCEPTION', updatedAt: new Date() })
+        .where(eq(invoices.id, invoiceId))
+        .returning();
+      return blocked;
+    }
+
     await this.db
       .update(invoices)
       .set({ status: 'PENDING_APPROVAL', updatedAt: new Date() })
@@ -240,6 +289,164 @@ export class InvoicesService {
 
     const [current] = await this.db.select().from(invoices).where(eq(invoices.id, invoiceId));
     return current;
+  }
+
+  /**
+   * Two- and three-way match against the referenced purchase order. Returns 'BLOCKED' when
+   * the invoice must not proceed to approval at all, otherwise 'PROCEED' — including when
+   * a variance was recorded, since variances are for approvers to decide on.
+   */
+  private async runPoMatch(
+    tenantId: string,
+    invoice: typeof invoices.$inferSelect,
+  ): Promise<'PROCEED' | 'BLOCKED'> {
+    // No PO cited: a non-PO invoice, which is legitimate and routes on amount alone.
+    if (!invoice.poNumber) return 'PROCEED';
+
+    const [po] = await this.db
+      .select()
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.tenantId, tenantId), eq(purchaseOrders.poNumber, invoice.poNumber)));
+
+    if (!po) {
+      await this.db.insert(invoiceExceptions).values({
+        invoiceId: invoice.id,
+        type: 'MISSING_PO',
+        detail: `The invoice cites purchase order ${invoice.poNumber}, which does not exist for this tenant.`,
+        suggestedFix:
+          'Confirm the PO number with the vendor, or create/sync the purchase order before processing.',
+      });
+      await this.logAudit(tenantId, invoice.id, 'PO_MATCH_FAILED', {
+        poNumber: invoice.poNumber,
+        reason: 'PO_NOT_FOUND',
+      });
+      return 'BLOCKED';
+    }
+
+    const lineRows = await this.db
+      .select()
+      .from(invoiceLineItems)
+      .where(eq(invoiceLineItems.invoiceId, invoice.id));
+
+    const [tenant] = await this.db.select().from(tenants).where(eq(tenants.id, tenantId));
+    const tolerances = resolveTolerances(tenant?.matchTolerances);
+
+    const result = matchInvoiceToPo({
+      invoiceLines: lineRows.map((l) => ({
+        id: l.id,
+        description: l.description,
+        quantity: Number(l.quantity),
+        unitPrice: Number(l.unitPrice),
+        lineTotal: Number(l.lineTotal),
+      })),
+      // Subtotal, not totalAmount: the PO is net of tax, so this comparison must be too.
+      invoiceNetTotal: invoice.subtotal === null ? null : Number(invoice.subtotal),
+      invoiceCurrency: invoice.currency,
+      poLines: (po.lineItems as PoLineItem[]) ?? [],
+      poTotal: po.totalAmount === null ? null : Number(po.totalAmount),
+      poCurrency: po.currency,
+      receivedQty: (po.receivedQty as Record<string, number> | null) ?? null,
+      tolerances,
+    });
+
+    // Link the invoice to the order and persist the variance figures. The flat numeric
+    // columns are what workflow CONDITION nodes read; matchResult carries the detail.
+    await this.db
+      .update(invoices)
+      .set({
+        purchaseOrderId: po.id,
+        priceVariancePct: result.maxPriceVariancePct,
+        quantityVariancePct: result.maxQuantityVariancePct,
+        totalVarianceAmount: result.totalVarianceAmount?.toFixed(2),
+        matchResult: result,
+        updatedAt: new Date(),
+      })
+      .where(eq(invoices.id, invoice.id));
+
+    // Record which PO line each invoice line matched, so the UI can show the pairing.
+    for (const line of result.lines) {
+      if (line.poLineNumber !== null) {
+        await this.db
+          .update(invoiceLineItems)
+          .set({ poLineNumber: line.poLineNumber })
+          .where(eq(invoiceLineItems.id, line.invoiceLineId));
+      }
+    }
+
+    await this.logAudit(tenantId, invoice.id, 'PO_MATCHED', {
+      poNumber: po.poNumber,
+      isClean: result.isClean,
+      maxPriceVariancePct: result.maxPriceVariancePct,
+      maxQuantityVariancePct: result.maxQuantityVariancePct,
+      totalVarianceAmount: result.totalVarianceAmount,
+    });
+
+    if (result.isClean) return 'PROCEED';
+
+    return this.recordMatchExceptions(invoice.id, po.poNumber, result);
+  }
+
+  /**
+   * Turns a non-clean match into exceptions, and decides whether it blocks. Currency
+   * disagreement and over-receipt are integrity failures; price and quantity variance are
+   * business decisions that continue into the approval graph.
+   */
+  private async recordMatchExceptions(
+    invoiceId: string,
+    poNumber: string,
+    result: PoMatchResult,
+  ): Promise<'PROCEED' | 'BLOCKED'> {
+    let blocked = false;
+
+    const currencyIssue = result.headerIssues.find((i) => i.includes('but PO is in'));
+    if (currencyIssue) {
+      await this.db.insert(invoiceExceptions).values({
+        invoiceId,
+        type: 'CURRENCY_MISMATCH',
+        detail: currencyIssue,
+        suggestedFix: 'Ask the vendor to reissue in the order currency, or correct the purchase order.',
+      });
+      blocked = true;
+    }
+
+    const overReceipts = result.lines.filter((l) => l.status === 'OVER_RECEIPT');
+    if (overReceipts.length > 0) {
+      await this.db.insert(invoiceExceptions).values({
+        invoiceId,
+        type: 'GRN_MISMATCH',
+        detail:
+          `Billed more than was received on ${overReceipts.length} line(s) of ${poNumber}. ` +
+          overReceipts.map((l) => l.explanation).join(' '),
+        suggestedFix:
+          'Confirm the goods receipt with the receiving team; if the delivery arrived, post the receipt first.',
+      });
+      blocked = true;
+    }
+
+    const variances = result.lines.filter(
+      (l) => l.status === 'PRICE_VARIANCE' || l.status === 'QUANTITY_VARIANCE',
+    );
+    const unmatched = result.lines.filter((l) => l.status === 'UNMATCHED');
+    const totalIssue = result.headerIssues.find((i) => i.includes('net total differs from the order'));
+
+    if (variances.length > 0 || unmatched.length > 0 || totalIssue) {
+      const details = [
+        ...variances.map((l) => l.explanation),
+        ...unmatched.map((l) => l.explanation),
+        totalIssue,
+      ].filter(Boolean);
+
+      await this.db.insert(invoiceExceptions).values({
+        invoiceId,
+        type: 'PO_MISMATCH',
+        detail: `Does not match ${poNumber} within tolerance. ${details.join(' ')}`,
+        suggestedFix: unmatched.length
+          ? 'Check whether the vendor billed an item that was never ordered, or worded a line differently to the PO.'
+          : 'Approve the variance if the change was agreed, otherwise ask the vendor for a credit note.',
+      });
+    }
+
+    return blocked ? 'BLOCKED' : 'PROCEED';
   }
 
   async correctField(tenantId: string, invoiceId: string, dto: CorrectFieldDto) {
@@ -295,6 +502,7 @@ export class InvoicesService {
         id: invoices.id,
         status: invoices.status,
         invoiceNumber: invoices.invoiceNumber,
+        poNumber: invoices.poNumber,
         invoiceDate: invoices.invoiceDate,
         currency: invoices.currency,
         totalAmount: invoices.totalAmount,
@@ -302,6 +510,8 @@ export class InvoicesService {
         sourceChannel: invoices.sourceChannel,
         createdAt: invoices.createdAt,
         vendorName: vendors.name,
+        priceVariancePct: invoices.priceVariancePct,
+        quantityVariancePct: invoices.quantityVariancePct,
       })
       .from(invoices)
       .leftJoin(vendors, eq(invoices.vendorId, vendors.id))

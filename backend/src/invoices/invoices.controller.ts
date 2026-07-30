@@ -16,6 +16,11 @@ export class InvoicesController {
     return this.invoicesService.ingest(tenantId, dto);
   }
 
+  @Get()
+  list(@Headers('x-tenant-id') tenantId: string) {
+    return this.invoicesService.findAll(tenantId);
+  }
+
   @Get('exceptions')
   exceptionQueue(@Headers('x-tenant-id') tenantId: string) {
     return this.invoicesService.findExceptionQueue(tenantId);

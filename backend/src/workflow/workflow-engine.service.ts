@@ -274,7 +274,7 @@ export class WorkflowEngineService {
   }
 
   /** Pending steps whose SLA deadline has already passed, for a dashboard or notifier. */
-  async findOverdueSteps(tenantId: string) {
+  async findOverdueSteps(tenantId: string, opts: { unreportedOnly?: boolean } = {}) {
     return this.db
       .select({
         step: approvalSteps,
@@ -290,6 +290,9 @@ export class WorkflowEngineService {
           eq(approvalSteps.status, 'PENDING'),
           isNull(approvalInstances.completedAt),
           lt(approvalSteps.slaDueAt, new Date()),
+          // The dashboard wants every overdue step; the escalation sweep wants only the
+          // ones it hasn't already acted on, or it re-fires every tick forever.
+          ...(opts.unreportedOnly ? [isNull(approvalSteps.slaBreachedAt)] : []),
         ),
       );
   }
@@ -301,11 +304,15 @@ export class WorkflowEngineService {
    * is not a safe default — but the breach is still recorded as an audit event so it
    * surfaces rather than passing silently.
    *
-   * Invoked on demand (endpoint) rather than on a timer; production wires this to the
-   * same scheduler/queue that will drive the rest of the pipeline.
+   * Each breach is reported exactly once: the node's pending steps get `slaBreachedAt`
+   * stamped, which takes them out of the sweep's candidate set. Without that, a node with
+   * no onSlaBreach edge would re-log a breach on every tick for as long as it sat there.
+   *
+   * Runs both from the scheduler (`SlaSchedulerService`) and on demand via
+   * POST /approvals/escalate-overdue.
    */
   async escalateOverdueSteps(tenantId: string) {
-    const overdue = await this.findOverdueSteps(tenantId);
+    const overdue = await this.findOverdueSteps(tenantId, { unreportedOnly: true });
 
     // One breach per parked node, not per step — a parallel node with three late
     // approvers is a single escalation decision.
@@ -343,6 +350,19 @@ export class WorkflowEngineService {
         escalated: Boolean(slaEdge),
       });
 
+      // Mark the breach as reported before acting on it, so a node left pending (no SLA
+      // edge) isn't picked up again by the next sweep.
+      await this.db
+        .update(approvalSteps)
+        .set({ slaBreachedAt: new Date() })
+        .where(
+          and(
+            eq(approvalSteps.instanceId, instance.id),
+            eq(approvalSteps.nodeId, node.id),
+            eq(approvalSteps.status, 'PENDING'),
+          ),
+        );
+
       if (!slaEdge) {
         escalated.push({ invoiceId: instance.invoiceId, nodeId: node.id, routedTo: null });
         continue;
@@ -362,6 +382,51 @@ export class WorkflowEngineService {
     }
 
     return { escalatedCount: escalated.length, escalated };
+  }
+
+  /**
+   * Tenants with at least one overdue step the sweep hasn't reported yet. Used by the
+   * scheduler so a tick only touches tenants with actual work, rather than every tenant
+   * in the database.
+   */
+  async findTenantsWithOverdueSteps(): Promise<string[]> {
+    const rows = await this.db
+      .selectDistinct({ tenantId: workflowDefinitions.tenantId })
+      .from(approvalSteps)
+      .innerJoin(approvalInstances, eq(approvalSteps.instanceId, approvalInstances.id))
+      .innerJoin(workflowDefinitions, eq(approvalInstances.workflowId, workflowDefinitions.id))
+      .where(
+        and(
+          eq(approvalSteps.status, 'PENDING'),
+          isNull(approvalInstances.completedAt),
+          lt(approvalSteps.slaDueAt, new Date()),
+          isNull(approvalSteps.slaBreachedAt),
+        ),
+      );
+    return rows.map((r) => r.tenantId);
+  }
+
+  /**
+   * Cross-tenant escalation sweep — what the scheduler calls. Each tenant is escalated
+   * independently so one tenant's malformed graph can't abort the others' sweeps.
+   */
+  async escalateOverdueStepsAllTenants() {
+    const tenantIds = await this.findTenantsWithOverdueSteps();
+    let escalatedCount = 0;
+    const failures: { tenantId: string; error: string }[] = [];
+
+    for (const tenantId of tenantIds) {
+      try {
+        const result = await this.escalateOverdueSteps(tenantId);
+        escalatedCount += result.escalatedCount;
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.logger.error(`SLA escalation failed for tenant ${tenantId}: ${error}`);
+        failures.push({ tenantId, error });
+      }
+    }
+
+    return { tenantsScanned: tenantIds.length, escalatedCount, failures };
   }
 
   /** Loads a step with its instance/graph context, enforcing tenant scope and PENDING status. */

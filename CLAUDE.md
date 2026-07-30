@@ -18,7 +18,7 @@ project docs — the short version is in "Core design decisions" below.
 - **ORM:** Drizzle ORM + `pg` (node-postgres) — NOT Prisma
 - **AI/Extraction service:** Python FastAPI, calls Claude API directly for vision-based extraction
 - **DB:** PostgreSQL 16
-- **Frontend:** React + TypeScript (not yet built — next milestone)
+- **Frontend:** React + TypeScript + Vite (`frontend/`), react-router, plain CSS, no UI kit
 
 ### Why not .NET/Java/Prisma
 This was built inside a sandboxed environment whose network allowlist covers npm and
@@ -60,11 +60,25 @@ export ANTHROPIC_API_KEY="sk-..."
 #     Serves a clean invoice ($1296), a low-amount one (url contains "lowamount", $486),
 #     and a deliberately inconsistent one (url contains "inconsistent").
 .venv/bin/python -m uvicorn mock_server:app --port 8001
+
+# 4. Frontend (separate terminal)
+cd frontend
+npm install
+npm run dev        # http://localhost:5173
 ```
+
+The UI needs a tenant UUID, entered in its header bar and kept in localStorage (the backend
+still resolves tenants from the `x-tenant-id` header). Get one with:
+`psql -c "SELECT id, name FROM tenants;"` — or set `VITE_TENANT_ID` in `frontend/.env`
+as a default (see `frontend/.env.example`).
 
 Tests: `cd backend && npm test` — Node's built-in runner, no DB or running server needed.
 
 API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
+
+Note the backend restarts fussily: `npx ts-node` leaves a child `node` process behind, so
+killing only the wrapper PID silently fails the next start with `EADDRINUSE`. Kill every PID
+matching `ts-node src/main.ts` before restarting.
 
 ## Core design decisions baked into the code (don't casually change these)
 
@@ -156,6 +170,37 @@ node — there's a regression test for exactly that.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
   29 tests covering `resolveNodeOutcome`, `evaluateCondition`, and `validateGraph`. These
   are the pure graph functions; anything touching the DB is still only verified by hand.
+- **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
+  on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
+  to disable). Escalations now fire without anyone calling the endpoint. Each breach is
+  reported once via the `approvalSteps.slaBreachedAt` stamp — before that existed, a node
+  with no `onSlaBreach` edge re-logged a breach on every tick forever. Verified live with a
+  1-minute cron: one audit row across multiple ticks, step left PENDING but not re-fired.
+- **Vendor resolution on ingest** — `resolveVendor()` upserts the extracted `vendorName` into
+  `vendors` (unique on `tenantId+name`) and sets `invoices.vendorId`. This also switched
+  **duplicate detection on for the first time**: it gates on `vendorId`, which nothing had
+  ever populated, so that check had never once run. Verified: ingesting the same mock invoice
+  twice now produces a `DUPLICATE_INVOICE` exception where it previously sailed through.
+- **`GET /invoices`** — list endpoint for the UI: vendor name joined in, plus a
+  `lowConfidenceFields` array so a client doesn't have to interpret `fieldConfidence` itself.
+  `GET /invoices/:id`, `GET /invoices/exceptions` and the correct-field response all join
+  vendor name too, so it reads consistently across screens.
+- **`PATCH /invoices/:id/correct-field` hardened** — `fieldName` is checked against a
+  `CORRECTABLE_FIELDS` allowlist and values are coerced per field. It previously wrote
+  `fieldName` straight into an `UPDATE ... SET`, so a client could rewrite `status`,
+  `tenantId` or `vendorId` through it; correcting a date also threw, because Drizzle needs a
+  `Date` for a timestamp column and the endpoint passed the raw string.
+- **Frontend** (`frontend/`, React + TS + Vite) — three screens, verified in a real browser
+  against the running API:
+  - **Invoice list** — status, vendor, amount, and a per-row confidence indicator
+    (`N fields flagged` / `clean`).
+  - **Invoice detail** — every extracted field beside its confidence and provenance; only
+    sub-threshold rows are highlighted, which is the per-field design made visible. Flagged
+    fields are editable inline against the correct-field endpoint, and server-side validation
+    errors render in the row. A correction flips the row to `corrected` at 100% and drops it
+    out of the flagged count.
+  - **Review queue** — `NEEDS_REVIEW` + `EXCEPTION`, showing each recorded exception's detail
+    and suggested fix, plus a generated summary of which fields were low-confidence and why.
 
 ## Not yet built (in rough priority order)
 1. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack. This is
@@ -168,9 +213,10 @@ node — there's a regression test for exactly that.
 2. **PO / goods-receipt matching** — `PurchaseOrder` table exists; no matching logic yet.
    `runValidation()` in `invoices.service.ts` is where this plugs in, next to the existing
    duplicate check.
-3. **Frontend** — nothing built yet. React + TS, Vite. Priority screens: invoice list,
-   invoice detail with confidence-flagged fields, exception queue, mobile approval view.
-   Note the per-field confidence design is currently only observable via the API.
+3. **Approvals in the UI** — the three review screens exist, but nothing in the frontend
+   touches the workflow engine. No approve/reject/delegate view, no overdue dashboard, no
+   mobile approval screen. `GET /approvals/:invoiceId` and the decide/delegate endpoints are
+   API-only, and the detail screen doesn't show where an invoice sits in its approval graph.
 4. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
 5. **AI copilot** — natural-language invoice search, GL coding suggestions, plain-language
    explanations of why an invoice is stuck (the extraction service's `_consistency_warnings`
@@ -182,9 +228,13 @@ node — there's a regression test for exactly that.
 8. **ERP connectors** — `ErpConnection` config storage exists; no actual connector logic.
 
 ### Known gaps in the workflow engine
-- **SLA escalation has no scheduler.** The mechanism works, but
-  `POST /approvals/escalate-overdue` has to be called to run it. Production should drive
-  `escalateOverdueSteps()` from a cron/queue; nothing here does that yet.
+- **The SLA scheduler is a single-process in-memory cron, with no locking.** Fine for one
+  API instance; run two replicas and both sweep, so a breach can be escalated twice. The
+  `slaBreachedAt` stamp narrows the window but is not a lock — the read and the write are
+  separate statements. Production wants a real queue, a leader election, or a
+  `SELECT ... FOR UPDATE SKIP LOCKED` claim.
+- **The cron expression is read at import time.** `SLA_ESCALATION_CRON` must be a real
+  process env var; a value in a `.env` file loaded later by `ConfigModule` is ignored.
 - **`advance()` is not transactional.** It performs several sequential writes (step
   inserts, `currentNodeId` updates, invoice status), so a crash mid-advance can leave an
   instance parked between nodes. Wrap the traversal in a Drizzle transaction before this
@@ -206,6 +256,28 @@ node — there's a regression test for exactly that.
   loads the definition fresh rather than snapshotting the graph onto the instance, so a
   graph edited underneath an in-flight instance changes that instance's remaining path.
   Pinning the graph (or the `version`) per instance is the safer model.
+
+### Known gaps in the frontend
+- **No tests at all.** Verified by driving a real browser against the running API, not by
+  anything repeatable. No component tests, no e2e suite.
+- **Tenant is typed into the header bar** and kept in localStorage, mirroring the backend's
+  `x-tenant-id` hack. It is a prototype affordance and should be deleted wholesale when SSO
+  lands, not adapted.
+- **Read-mostly.** The only write in the whole UI is correct-field. No ingestion/upload
+  screen (invoices arrive via `POST /invoices` by hand), no approval actions, no way to
+  resolve an exception — `invoiceExceptions.resolvedAt` has no endpoint or UI behind it.
+- **Duplicated constants.** `CONFIDENCE_REVIEW_THRESHOLD`, the correctable-field list and
+  the field labels are restated in `frontend/src/lib/confidence.ts`. The backend stays
+  authoritative (it returns `lowConfidenceFields` and rejects non-allowlisted fields), but
+  the copies can drift out of sync with no test to catch it.
+- **No pagination, filtering, or sorting** on the invoice list — it renders every invoice
+  the tenant has in one table.
+- **`vendorName` is shown with a confidence score but is not editable**, because correcting
+  it means re-linking a `Vendor` row rather than writing a column. It's the one field on the
+  detail screen with a confidence and no Edit affordance.
+- **Vendor matching is exact-name.** `resolveVendor()` does no normalisation, so
+  "Acme Inc." and "Acme, Inc" become two vendors — and duplicate detection, which keys on
+  `vendorId`, won't see invoices from those two as related.
 
 ## Conventions
 - Tenant ID always comes first in service method signatures: `(tenantId, ...)`.

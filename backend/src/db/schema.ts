@@ -64,6 +64,9 @@ export const vendors = pgTable('vendors', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantIdx: index('vendors_tenant_idx').on(t.tenantId),
+  // Lets ingestion upsert a vendor by name without two concurrent invoices from the
+  // same vendor racing to create duplicate rows.
+  tenantNameUnique: unique().on(t.tenantId, t.name),
 }));
 
 export const purchaseOrders = pgTable('purchase_orders', {
@@ -164,6 +167,10 @@ export const approvalSteps = pgTable('approval_steps', {
   status: approvalStepStatusEnum('status').notNull().default('PENDING'),
   comment: text('comment'),
   slaDueAt: timestamp('sla_due_at'),
+  // Stamped when an SLA breach has been reported for this step, so the escalation sweep
+  // reports each breach once instead of re-firing on every tick. A step whose node has no
+  // onSlaBreach edge stays PENDING and still shows as overdue — it just stops re-escalating.
+  slaBreachedAt: timestamp('sla_breached_at'),
   actedAt: timestamp('acted_at'),
 }, (t) => ({
   instanceIdx: index('approval_steps_instance_idx').on(t.instanceId),

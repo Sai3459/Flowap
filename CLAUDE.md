@@ -113,6 +113,37 @@ truncate each other mid-run and everything fails at once.
 CI (`.github/workflows/ci.yml`) runs all four. ⚠️ The workflow has never executed — no runner
 was available where it was written — though every command in it passes locally.
 
+## Testing inbound mail
+
+```bash
+sudo apt-get install -y dovecot-imapd
+sudo scripts/dev-mailbox.sh start                    # IMAP on 127.0.0.1:10143
+scripts/dev-mailbox.sh deliver some-invoice.pdf      # + an image001.png, as a real mailbox has
+INBOUND_IMAP_HOST=127.0.0.1 INBOUND_IMAP_PORT=10143 INBOUND_IMAP_SECURE=false \
+INBOUND_IMAP_USER=ap@test.local INBOUND_IMAP_PASSWORD=testpass \
+INBOUND_TENANT_ID=<tenant> npx ts-node src/main.ts
+```
+
+A local server is the right default for development: no secrets, works offline, and you
+control exactly which messages exist. `backend/scratch/imap-smoke.ts` and
+`backend/scratch/imap-e2e.ts` drive it directly; neither is part of the suite, because CI has
+no mail server.
+
+**Using a real provider instead**, when provider-specific behaviour is what you need to test:
+
+- **Gmail** works with `imap.gmail.com:993`, but *not* with the account password. It needs
+  2-Step Verification enabled and a 16-character **App Password**, and IMAP switched on in
+  Gmail settings. Treat that password as a real credential — never commit it, and never put
+  it in `.env.example`.
+- **Microsoft 365 does not work this way at all.** Basic authentication for IMAP was disabled
+  across Exchange Online in 2022, so a username and password will simply be refused no matter
+  how it is configured. It requires OAuth2 with a registered Entra ID application. Since most
+  corporate AP mailboxes are on Microsoft 365, **a production connector will need OAuth2**,
+  and `ImapMailboxSource`'s password-based config is a development affordance rather than the
+  eventual shape.
+- Disposable inbox services (Mailinator, Mailsac) mostly put IMAP behind a paid tier; their
+  free tiers are HTTP-only and will not exercise this code path.
+
 API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
 
 Note the backend restarts fussily: `npx ts-node` leaves a child `node` process behind, so
@@ -236,11 +267,15 @@ node — there's a regression test for exactly that.
     came of it.
   - `GET /inbound/messages`, `POST /inbound/poll` (sweep now), a 5-minute cron, and an
     "Arrived by email" panel on the Upload screen.
-  - ⚠️ **The IMAP transport has never opened a socket** — no mail server exists in this
-    sandbox. Everything that *decides* anything sits behind the `MailboxSource` interface and
-    is proven against a fake mailbox (8 integration tests, using the real Arena Media PDF
-    bytes, asserting byte-for-byte storage and that a re-delivered message cannot become a
-    second invoice). `ImapMailboxSource` itself is the unproven part.
+  - **The IMAP transport has now been run against a real server.** A local Dovecot was stood
+    up, three realistic messages delivered (a genuine invoice PDF; an invoice plus an Outlook
+    signature image plus a .docx; a reply with no attachment), and the full path exercised:
+    3 messages fetched → 2 invoices created → the signature image and Office document skipped
+    with reasons → the bare reply recorded as `no-attachments` → **a second poll fetched 0**,
+    proving `\Seen` and the dedupe key both hold. Reproduce it with
+    `scripts/dev-mailbox.sh` (see "Testing inbound mail" below).
+  - Logic is additionally covered by 8 integration tests against a fake mailbox, using the
+    real Arena Media PDF bytes and asserting byte-for-byte storage.
   - Config is per-process (`INBOUND_IMAP_*`) and belongs in per-tenant config with the
     password in a secret store; that arrives with the config plane.
 - **Vendor identity is a normalised key, not the printed name** (`src/vendors/vendor-name.ts`).

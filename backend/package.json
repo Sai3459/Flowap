@@ -9,7 +9,9 @@
     "build": "tsc -p tsconfig.build.json",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "test": "node --require ts-node/register --test src/**/*.spec.ts"
+    "test": "node --require ts-node/register --test \"src/**/*.spec.ts\"",
+    "db:seed": "ts-node src/db/seed.ts",
+    "test:integration": "node --require ts-node/register --test-concurrency=1 --test \"src/**/*.int-spec.ts\""
   },
   "keywords": [],
   "author": "",

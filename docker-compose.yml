@@ -1,0 +1,88 @@
+# Full local stack: Postgres, the API, the mock extractor and the UI, in one command.
+#
+#   docker compose up --build
+#   docker compose run --rm backend npm run db:seed   # prints the tenant id for the UI
+#
+# The extractor runs the *mock* by default, so the stack needs no ANTHROPIC_API_KEY. To use
+# the real vision path instead, set ANTHROPIC_API_KEY in a .env file beside this one and
+# override the command:
+#
+#   extraction:
+#     command: python -m uvicorn main:app --host 0.0.0.0 --port 8001
+#
+# NOTE: this file has not been executed. The sandbox this was written in has the docker CLI
+# but no daemon, so `docker compose up` was never run against it — treat it as unverified
+# until someone with a working Docker runs it.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: invoice_platform
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The API's first act is to open a pool, so waiting for "accepting connections" rather
+      # than merely "container started" is what keeps the first boot from crash-looping.
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d invoice_platform']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  extraction:
+    build:
+      context: ./extraction-service
+    command: python -m uvicorn mock_server:app --host 0.0.0.0 --port 8001
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - '8001:8001'
+    healthcheck:
+      test: ['CMD-SHELL', 'python -c "import urllib.request;urllib.request.urlopen(\"http://localhost:8001/health\")"']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql://postgres:devpass@postgres:5432/invoice_platform
+      EXTRACTION_SERVICE_URL: http://extraction:8001
+      PORT: '3000'
+      # Uploaded files are served back by URL for the extractor to fetch, so the API has to
+      # know how it is reachable from *inside* the network, not from the browser.
+      PUBLIC_API_URL: http://backend:3000
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      extraction:
+        condition: service_started
+    volumes:
+      # Uploads live on local disk (FileStorageService), so without this every restart
+      # orphans the documents already ingested.
+      - uploads:/app/uploads
+    # Schema push on boot: this project uses `drizzle-kit push`, not migration files, so
+    # there is nothing to "run" beyond reconciling the schema.
+    command: sh -c "npx drizzle-kit push --force && npx ts-node src/main.ts"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      # Reached from the browser, so this is the published port on the host, not the
+      # service name the backend container answers to.
+      VITE_API_BASE_URL: http://localhost:3000
+    ports:
+      - '5173:5173'
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  uploads:

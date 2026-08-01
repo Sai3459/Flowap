@@ -38,6 +38,17 @@ project with `ts-node`, and keep `typescript` pinned to `5.7.3` in package.json 
 `ts-node@10.9.2` has a config-loading crash against TypeScript 7.x.
 
 ## How to run locally
+
+**The short way** — everything in one command:
+```bash
+docker compose up --build
+docker compose run --rm backend npm run db:seed   # prints the tenant id the UI needs
+```
+⚠️ The compose file and the three Dockerfiles have **never been executed** — they were written
+in a sandbox with the docker CLI but no daemon. The commands inside them are the ones used by
+hand below, but the wiring is unproven.
+
+**The long way**, which is what every check in this repo has actually run against:
 ```bash
 # 1. Postgres (adjust for your OS/package manager)
 createdb invoice_platform
@@ -48,6 +59,7 @@ npm install
 export DATABASE_URL="postgresql://postgres:<password>@localhost:5432/invoice_platform"
 export EXTRACTION_SERVICE_URL="http://localhost:8001"
 npx drizzle-kit push --force   # applies schema — see src/db/schema.ts
+npm run db:seed                # tenants, users, GL/cost centres, PO-5000, workflow definitions
 npx ts-node src/main.ts        # NOT npx tsx
 
 # 3. Extraction service (separate terminal)
@@ -62,7 +74,7 @@ export ANTHROPIC_API_KEY="sk-..."
 #       currencymismatch | nopo | lowamount | inconsistent
 #     The PO scenarios assume this order exists:
 #       PO-5000, Northwind Traders, 20 x "Consulting hours" @ 60.00 USD, received 20
-#     Seed it via POST /purchase-orders (see "Purchase order API" below).
+#     `npm run db:seed` creates it — don't hand-POST it any more.
 .venv/bin/python -m uvicorn mock_server:app --port 8001
 
 # 4. Frontend (separate terminal)
@@ -72,11 +84,30 @@ npm run dev        # http://localhost:5173
 ```
 
 The UI needs a tenant UUID, entered in its header bar and kept in localStorage (the backend
-still resolves tenants from the `x-tenant-id` header). Get one with:
-`psql -c "SELECT id, name FROM tenants;"` — or set `VITE_TENANT_ID` in `frontend/.env`
-as a default (see `frontend/.env.example`).
+still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints it — or set
+`VITE_TENANT_ID` in `frontend/.env` as a default (see `frontend/.env.example`).
 
-Tests: `cd backend && npm test` — Node's built-in runner, no DB or running server needed.
+## Tests
+
+```bash
+cd backend && npm test               # 100 unit tests — no DB, no server
+cd backend && npm run test:integration   # 27 integration tests — needs DATABASE_URL
+cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
+cd frontend && npm run build         # typecheck + build; there are no frontend tests
+```
+
+`test:integration` derives its database by appending `_test` to `DATABASE_URL`'s database
+name, creates it if absent, pushes the schema with the same `drizzle-kit push` used
+everywhere else, and truncates every table between tests — so it can never touch a
+development database, and it **empties whatever it points at**. With no `DATABASE_URL` the
+suites skip cleanly rather than fail, which is what keeps `npm test` DB-free.
+
+Test files run in separate processes concurrently by default, and they share one test
+database, so integration runs are pinned to `--test-concurrency=1`. Without it the files
+truncate each other mid-run and everything fails at once.
+
+CI (`.github/workflows/ci.yml`) runs all four. ⚠️ The workflow has never executed — no runner
+was available where it was written — though every command in it passes locally.
 
 API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
 
@@ -95,9 +126,17 @@ matching `ts-node src/main.ts` before restarting.
 2. **The extraction service never trusts the model's self-reported confidence alone.**
    `_apply_arithmetic_consistency_checks()` in `extraction-service/main.py` independently
    verifies subtotal+tax=total and sum(line items)=subtotal, downgrading confidence when
-   the arithmetic doesn't hold regardless of what the model claimed. This is unit-tested
-   and verified working (see conversation history) — a deliberately-wrong total was
-   correctly caught and downgraded from 0.95 to 0.4 confidence.
+   the arithmetic doesn't hold regardless of what the model claimed.
+   This entry previously claimed the check was unit-tested. It was not — it had been verified
+   interactively in an earlier session and never committed as a test, so nothing in the repo
+   would have caught a regression in the single most important piece of logic in the
+   extraction service. `extraction-service/test_consistency.py` now covers it (13 tests):
+   both checks, the rounding tolerance boundary, `min()` never *raising* an already-low
+   confidence, and unparseable/missing amounts leaving the pass inert rather than crashing
+   ingestion.
+   Note this check is Python-side, so the backend's own suite cannot reach it: the TypeScript
+   integration tests stub the extractor and therefore test the *confidence gate*, not the
+   arithmetic that feeds it. Both halves are needed.
 
 3. **Workflow is a graph (`workflowDefinitions.graph` jsonb: `{nodes, edges}`), not a
    fixed N-level chain.** This is the anti-rigidity design — a visual builder sits on
@@ -172,11 +211,43 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  97 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  100 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
-  `validatePoPayload`, and the re-validation rules (`revalidationDecision`,
-  `correctionBlockedByApproval`). These are the pure functions; anything touching the DB is
-  still only verified by hand.
+  `validatePoPayload`, the re-validation rules (`revalidationDecision`,
+  `correctionBlockedByApproval`), and the fixture drift guard.
+- **Developer plane (Phase 0)** — the first automated checks this repo has had, and the first
+  way to stand it up that isn't "a developer with psql access".
+  - **`npm run db:seed`** (`src/db/seed.ts`) — tenants, users, GL accounts, cost centres,
+    PO-5000/PO-6000 and the three workflow definitions. Idempotent by natural key (tenants by
+    name, users by **email**, POs by `poNumber`, definitions by name), so re-running updates
+    rather than duplicating and never touches transactional rows. Changing a seed email does
+    not rename a user — it creates a second one and orphans the existing approval history.
+  - **Integration harness** (`src/test-support/db.ts`) — derives a `_test` database from
+    `DATABASE_URL`, creates it, pushes the schema, truncates every table between tests.
+    Truncate rather than transaction-rollback because the services hold `DatabaseService.db`
+    directly; rolling back would mean threading a transaction handle through every service
+    signature, which is production code changed in service of tests.
+  - **`src/test-support/services.ts`** wires the real services by hand — they are plain
+    classes with constructor injection, so `@nestjs/testing` buys nothing. Only the extractor
+    is stubbed; matching, workflow traversal, coding, posting and the audit trail are all
+    production code against real Postgres.
+  - **27 integration tests** (`*.int-spec.ts`) over the paths that were previously
+    hand-verified only: the nine ingestion scenarios end to end, net-vs-net PO comparison,
+    duplicate detection, late-PO re-validation, workflow traversal, ALL/ANY node semantics,
+    sibling skipping, delegation not deadlocking an ALL node, SLA inheritance on handoff, the
+    approver check, and tenant isolation on both reads and PO matching. Two are labelled
+    `DOCUMENTS:` — they assert *current* behaviour for the known double-advance race and the
+    UNIQUE-instance constraint, so those gaps are measured rather than remembered.
+  - **Scenario fixtures** (`src/test-support/fixtures.ts`) — the nine mock documents as typed
+    TypeScript. They exist twice (here and in `mock_server.py`) because the Python one drives
+    the live system and the frontend; `fixtures.spec.ts` parses the Python source and fails if
+    the scenario names or invoice numbers drift, and also asserts every fixture is
+    arithmetically self-consistent except the one that must not be. Verified the guard bites
+    by breaking a number and watching it fail.
+  - **`extraction-service/test_consistency.py`** — 13 tests for the arithmetic pass, which had
+    none (see design decision 2).
+  - **`.github/workflows/ci.yml`**, **`docker-compose.yml`** and three Dockerfiles — written,
+    never executed. See the warnings in "How to run locally".
 - **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
   on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
   to disable). Escalations now fire without anyone calling the endpoint. Each breach is
@@ -315,13 +386,52 @@ node — there's a regression test for exactly that.
     card just appears. Verified by scrubbing the animation in a real browser: at 250ms it is
     at scale 0.74 / z −162 / opacity 0.55, settled by 1700ms, gone by 2600ms.
 
+## Architecture direction (agreed, phased)
+
+The system has four planes, and until Phase 0 it had exactly one.
+
+1. **Work plane** — AP clerks, approvers, controllers. The nine screens. Read/write
+   *transactions*. Built.
+2. **Config plane** — the customer's own admins. Workflow definitions (create, version,
+   publish, retire, simulate), tolerances, GL/cost-centre master, users and roles, SLA
+   policies. Read/write *rules*. **Not built.** Decided: this ships as a **separate frontend
+   bundle**, not role-gated routes in the work app — different users, different risk, and the
+   AP clerk's browser should never receive rule-editing code. A UI role check is not a
+   security boundary.
+3. **Integration plane** — system-to-system, no human. Connector interface, per-tenant
+   credentials in a **secret store** (not the `erpConnections.config` jsonb, where one SELECT
+   would expose a customer's ERP password), scheduled sync jobs, idempotent replay, retry with
+   a dead-letter queue, and outbound events. **Not built** — `erpConnections` is still a table
+   with zero code references.
+4. **Developer plane** — CI, seeds, fixtures, local stack, test harness. **This is Phase 0,
+   and it is what just landed.**
+
+**Backend stays one modular monolith.** Different apps in the UI does not mean different
+services in the backend; splitting now buys distributed transactions and pays nothing. The
+extraction service stays separate because it is Python and scales on a different curve.
+
+**Hard dependency:** the config plane cannot ship before real auth. Anyone can currently send
+any `x-tenant-id`; adding rule-editing on top of that lets anyone rewrite anyone's approval
+routing, i.e. approve their own invoices. Auth is a prerequisite for Phase 1, not an item
+beside it.
+
+Phase order: **0 developer plane (done)** → 1 auth + config plane → 2 integration framework
+with one real connector → 3 per-tenant sandbox and workflow simulation ("run these 200
+invoices through the draft graph and show me where they land"), which is both a test tool and
+the safe way to change a live workflow.
+
+Deliberately excluded: microservices, and any customer-authored scripting/plugin system.
+Configuration-as-data plus a good connector interface covers the real cases without handing
+customers a way to break their own tenant.
+
 ## Not yet built (in rough priority order)
 1. **One real extraction run.** The vision path in `extraction-service/main.py` fetches the
    document and calls Claude, and uploads now feed it a genuine URL — but no real PDF and no
    real `ANTHROPIC_API_KEY` has ever gone through it. Every result in this repo, including the
    screenshots, came from `mock_server.py`. Until this runs once, the extraction claims are
    unverified.
-2. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
+2. **Real auth** — *now also the gate on the whole config plane, see above.*
+   SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
    workspace's "acting as" picker. This is also what makes the approver check real:
    `decideStep`/`delegateStep` verify the caller is the step's assigned approver, but against a
    **client-supplied** `approverId`. That stops wrong-user and accidental decisions; it is not

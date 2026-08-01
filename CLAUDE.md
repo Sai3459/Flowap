@@ -38,26 +38,60 @@ project with `ts-node`, and keep `typescript` pinned to `5.7.3` in package.json 
 `ts-node@10.9.2` has a config-loading crash against TypeScript 7.x.
 
 ## How to run locally
+
+```bash
+./install.sh
+```
+
+That's the whole setup. It installs backend npm deps, creates
+`extraction-service/.venv` and installs the Python deps, seeds both `.env` files from
+their `.env.example` templates, creates the Postgres database, and pushes the Drizzle
+schema. Every step is idempotent — re-run it after a `git pull` to pick up new
+dependencies or schema changes. `./install.sh --help` lists the flags
+(`--skip-node`, `--skip-python`, `--skip-db`, `--no-venv`).
+
+Prerequisites the script checks for but does not install: Node 20+, Python 3.10+, and a
+running PostgreSQL 16 with the `psql` client on PATH.
+
+Then start the two services in separate terminals:
+
+```bash
+# 1. Extraction service
+cd extraction-service && .venv/bin/python -m uvicorn main:app --port 8001
+# ...or, with no ANTHROPIC_API_KEY, the mock the backend was verified against:
+cd extraction-service && .venv/bin/python -m uvicorn mock_server:app --port 8001
+
+# 2. Backend
+cd backend && npm start        # runs ts-node src/main.ts — NOT tsx, see gotcha above
+```
+
+API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
+
+<details>
+<summary>Manual setup, if you'd rather not use the script</summary>
+
 ```bash
 # 1. Postgres (adjust for your OS/package manager)
 createdb invoice_platform
 
 # 2. Backend
 cd backend
-npm install
-export DATABASE_URL="postgresql://postgres:<password>@localhost:5432/invoice_platform"
-export EXTRACTION_SERVICE_URL="http://localhost:8001"
+npm ci
+cp .env.example .env           # then edit DATABASE_URL / EXTRACTION_SERVICE_URL
 npx drizzle-kit push --force   # applies schema — see src/db/schema.ts
 npx ts-node src/main.ts        # NOT npx tsx
 
 # 3. Extraction service (separate terminal)
 cd extraction-service
-pip install -r requirements.txt   # (generate via pip freeze once finalized)
-export ANTHROPIC_API_KEY="sk-..."
-python3 -m uvicorn main:app --port 8001
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+export ANTHROPIC_API_KEY="sk-ant-..."   # main.py reads it from the environment
+.venv/bin/python -m uvicorn main:app --port 8001
 ```
 
-API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorators).
+Note that the backend auto-loads `backend/.env` via `ConfigModule`, but the extraction
+service reads `ANTHROPIC_API_KEY` straight from `os.environ` — export it, or
+`set -a; source .env; set +a` before starting uvicorn.
+</details>
 
 ## Core design decisions baked into the code (don't casually change these)
 

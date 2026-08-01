@@ -1,0 +1,33 @@
+@import 'tailwindcss';
+
+/* Tailwind v4 is configured here, not in a tailwind.config.js. Tokens declared in
+   @theme become utilities — `--color-ink` gives you `text-ink`, `bg-ink`, etc.
+   Replace these placeholders once the real palette is settled. */
+@theme {
+  --color-surface: #ffffff;
+  --color-sunken: #f6f7f9;
+  --color-ink: #10131a;
+  --color-muted: #5c6472;
+  --color-line: #e3e6ea;
+  --color-accent: #2563eb;
+}
+
+/* Dark mode overrides the generated custom properties directly. It must NOT be a
+   second @theme block: Tailwind flattens @theme regardless of any wrapping at-rule,
+   so a nested one would apply these values in light mode too. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-surface: #10131a;
+    --color-sunken: #0a0c11;
+    --color-ink: #f2f4f7;
+    --color-muted: #9aa3b2;
+    --color-line: #242a35;
+    --color-accent: #60a5fa;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}

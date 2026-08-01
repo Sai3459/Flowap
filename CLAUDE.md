@@ -18,7 +18,8 @@ project docs — the short version is in "Core design decisions" below.
 - **ORM:** Drizzle ORM + `pg` (node-postgres) — NOT Prisma
 - **AI/Extraction service:** Python FastAPI, calls Claude API directly for vision-based extraction
 - **DB:** PostgreSQL 16
-- **Frontend:** React + TypeScript (not yet built — next milestone)
+- **Frontend:** React 19 + TypeScript on Vite, Tailwind v4, Motion for animation —
+  scaffold only so far, see `frontend/README.md`
 
 ### Why not .NET/Java/Prisma
 This was built inside a sandboxed environment whose network allowlist covers npm and
@@ -113,8 +114,10 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 6. **Feedback loop** — `/feedback` endpoint on the extraction service is a stub; needs to
    actually persist corrections per tenant/vendor-layout and feed them back into the
    extraction prompt as few-shot examples.
-7. **Frontend** — nothing built yet. React + TS, Vite. Priority screens: invoice list,
-   invoice detail with confidence-flagged fields, exception queue, mobile approval view.
+7. **Frontend screens** — the Vite + React + TS + Tailwind + Motion scaffold exists in
+   `frontend/`, but `src/App.tsx` is still a placeholder and nothing calls the API yet.
+   Priority screens: invoice list, invoice detail with confidence-flagged fields,
+   exception queue, mobile approval view.
 8. **Vendor portal** — separate, simplified auth context and shell.
 9. **ERP connectors** — `ErpConnection` config storage exists; no actual connector logic.
 

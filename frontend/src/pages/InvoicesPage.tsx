@@ -77,7 +77,7 @@ export function InvoicesPage() {
                           </span>
                         : <span className="pill p-clear">in tolerance</span>}
                   </td>
-                  <td style={{ color: 'var(--violet)' }}>{inv.erpDocumentNumber ?? <span className="mute">—</span>}</td>
+                  <td style={{ color: 'var(--posted)' }}>{inv.erpDocumentNumber ?? <span className="mute">—</span>}</td>
                 </tr>
               ))}
             </tbody>

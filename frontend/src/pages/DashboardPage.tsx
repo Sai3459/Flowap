@@ -119,7 +119,7 @@ export function DashboardPage() {
         <div className="card">
           <div className="card-head"><h2>Posted to the ERP</h2><span className="lbl">simulated</span></div>
           <div className="stat">
-            <span className="v" style={{ color: 'var(--violet)' }}>{posted.count}</span>
+            <span className="v" style={{ color: 'var(--posted)' }}>{posted.count}</span>
             <span className="d"><Money amount={posted.value} /> handed back</span>
           </div>
           <p className="mute small">

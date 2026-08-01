@@ -270,10 +270,16 @@ node — there's a regression test for exactly that.
   approvals does this need".
 - **Dashboard** — `GET /dashboard`: counts and value by status, open exceptions by type, overdue
   approvals, touchless rate, and recent audit activity in one aggregate read.
-- **Frontend** (`frontend/`, React + TS + Vite) — a single role-switched workspace in a dark
-  telemetry design system (mono for all data, four semantic colours, per-field confidence shown
-  as a ten-segment equalizer). Verified in a real browser: upload → code → approve → post ran
-  end to end and produced ERP document 5106040049.
+- **Frontend** (`frontend/`, React + TS + Vite) — a single role-switched workspace. The design
+  system is a tonal blue-slate palette (`#212A31` ground, `#2E3944` panels, `#124E66` petrol
+  accent, `#748D92` muted text, `#D3D9D4` ink) with monospace on every value and label and
+  per-field confidence shown as a ten-segment equalizer. The palette supplies no signal
+  colours, so the four state colours are desaturated to sit in the same key rather than
+  punching out of it — `--clear` sage, `--review` dusty gold, `--blocked` clay, `--inflight`
+  petrol, plus a receding neutral for posted. All tokens live in `:root` of `index.css`;
+  components reference them by name and hard-code no colour.
+  Verified in a real browser: upload → code → approve → post ran end to end and produced ERP
+  document 5106040049.
   - **Overview** — pipeline by status, open exceptions, overdue approvals, touchless rate, audit feed.
   - **Upload** — drag-and-drop inbound, showing each document's outcome immediately.
   - **Invoices** — filterable list with confidence and PO-match indicators and the ERP doc number.

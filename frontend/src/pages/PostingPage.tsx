@@ -99,7 +99,7 @@ export function PostingPage() {
               <tbody>
                 {(posted.data ?? []).map((inv) => (
                   <tr key={inv.id}>
-                    <td style={{ color: 'var(--violet)' }}>{inv.erpDocumentNumber}</td>
+                    <td style={{ color: 'var(--posted)' }}>{inv.erpDocumentNumber}</td>
                     <td><Link to={`/invoices/${inv.id}`}>{inv.invoiceNumber ?? inv.id.slice(0, 8)}</Link></td>
                     <td className="mute">{inv.poNumber ?? 'non-PO'}</td>
                     <td className="r"><Money amount={inv.totalAmount} currency={inv.currency} /></td>

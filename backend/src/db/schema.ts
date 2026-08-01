@@ -11,7 +11,9 @@ import {
   integer,
   index,
   unique,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 // Design principles carried over from the original schema:
 // 1. Every extracted field stores confidence + provenance -> fieldConfidence jsonb on invoices.
@@ -30,8 +32,36 @@ export const exceptionTypeEnum = pgEnum('exception_type', [
 
 export const fieldSourceEnum = pgEnum('field_source', ['AI_EXTRACTED', 'HUMAN_CORRECTED', 'MANUAL_ENTRY']);
 
+/**
+ * SKIPPED and CANCELLED are deliberately distinct, and `resolveNodeOutcome` excludes both:
+ * SKIPPED means a sibling decided this node for you (an ANY node carried, or an ALL node
+ * failed), while CANCELLED means the whole instance was recalled out from under the step.
+ * Collapsing them would lose the difference between "someone else answered" and "the question
+ * was withdrawn", which is exactly what an auditor is asking about.
+ */
 export const approvalStepStatusEnum = pgEnum('approval_step_status', [
-  'PENDING', 'APPROVED', 'REJECTED', 'SKIPPED', 'DELEGATED',
+  'PENDING', 'APPROVED', 'REJECTED', 'SKIPPED', 'DELEGATED', 'CANCELLED',
+]);
+
+/**
+ * ACTIVE is the only status that lets an instance be decided, and at most one per invoice may
+ * hold it — enforced by a partial unique index, not by application code.
+ *
+ * COMPLETED   reached END or REJECT normally.
+ * SUPERSEDED  replaced by a fresh instance after a recall; `supersededByInstanceId` points at it.
+ * CANCELLED   abandoned with no successor.
+ */
+export const approvalInstanceStatusEnum = pgEnum('approval_instance_status', [
+  'ACTIVE', 'COMPLETED', 'SUPERSEDED', 'CANCELLED',
+]);
+
+/**
+ * A published definition is immutable. Editing produces a new DRAFT which is published as a
+ * new version, so an instance already pointing at the old row keeps its original graph with
+ * no per-instance snapshot. A RETIRED definition is never deleted for the same reason.
+ */
+export const workflowDefinitionStatusEnum = pgEnum('workflow_definition_status', [
+  'DRAFT', 'PUBLISHED', 'RETIRED',
 ]);
 
 export const tenants = pgTable('tenants', {
@@ -236,21 +266,48 @@ export const workflowDefinitions = pgTable('workflow_definitions', {
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
   name: text('name').notNull(),
   version: integer('version').notNull().default(1),
-  isActive: boolean('is_active').notNull().default(true),
+  status: workflowDefinitionStatusEnum('status').notNull().default('DRAFT'),
   graph: jsonb('graph').notNull(), // { nodes: [...], edges: [...] }
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
-  tenantActiveIdx: index('workflow_tenant_active_idx').on(t.tenantId, t.isActive),
+  tenantStatusIdx: index('workflow_tenant_status_idx').on(t.tenantId, t.status),
+  // Publishing v2 inserts a new row rather than editing v1, so (name, version) is the
+  // natural key of a definition and must not collide.
+  tenantNameVersionUnique: unique().on(t.tenantId, t.name, t.version),
+  // At most one PUBLISHED definition per tenant. startInstance picks "the" published
+  // definition, and two of them would make which graph an invoice gets depend on row order.
+  onePublishedPerTenant: uniqueIndex('workflow_one_published_per_tenant')
+    .on(t.tenantId)
+    .where(sql`status = 'PUBLISHED'`),
 }));
 
 export const approvalInstances = pgTable('approval_instances', {
   id: uuid('id').primaryKey().defaultRandom(),
-  invoiceId: uuid('invoice_id').notNull().unique().references(() => invoices.id),
+  // NOT unique: an invoice may accumulate several instances over its life as it is recalled
+  // and re-run. The partial index below is what keeps at most one of them live.
+  invoiceId: uuid('invoice_id').notNull().references(() => invoices.id),
+  /**
+   * The definition *row*, not a version number — which is what makes versioning free.
+   * Published definitions are immutable, so an in-flight instance keeps pointing at the graph
+   * it started under even after a v2 is published.
+   */
   workflowId: uuid('workflow_id').notNull().references(() => workflowDefinitions.id),
+  status: approvalInstanceStatusEnum('status').notNull().default('ACTIVE'),
   currentNodeId: text('current_node_id'),
+  /** Set on the superseded instance, pointing forward at the one that replaced it. */
+  supersededByInstanceId: uuid('superseded_by_instance_id'),
+  /** Why this instance stopped being live — free text, shown in the invoice's history. */
+  reason: text('reason'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   completedAt: timestamp('completed_at'),
-});
+}, (t) => ({
+  invoiceIdx: index('approval_instances_invoice_idx').on(t.invoiceId),
+  // The supersede invariant, enforced by the database rather than by application code: a
+  // buggy path or two concurrent requests cannot produce two live instances for one invoice.
+  oneActivePerInvoice: uniqueIndex('approval_instances_one_active_per_invoice')
+    .on(t.invoiceId)
+    .where(sql`status = 'ACTIVE'`),
+}));
 
 export const approvalSteps = pgTable('approval_steps', {
   id: uuid('id').primaryKey().defaultRandom(),

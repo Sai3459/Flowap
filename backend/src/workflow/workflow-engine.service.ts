@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -33,13 +34,99 @@ export class WorkflowEngineService {
     return this.database.db;
   }
 
+  /**
+   * Creates a new DRAFT definition. Drafts route nothing — `publishDefinition` is what puts
+   * one into service.
+   *
+   * `version` is now actually set (max for this name, plus one). It previously defaulted to 1
+   * on every row, so `startInstance`'s ordering by version never discriminated.
+   */
   async createDefinition(tenantId: string, dto: CreateWorkflowDefinitionDto) {
     validateGraph(dto.graph);
+
+    const [latest] = await this.db
+      .select({ version: workflowDefinitions.version })
+      .from(workflowDefinitions)
+      .where(and(eq(workflowDefinitions.tenantId, tenantId), eq(workflowDefinitions.name, dto.name)))
+      .orderBy(desc(workflowDefinitions.version))
+      .limit(1);
+
     const [def] = await this.db
       .insert(workflowDefinitions)
-      .values({ tenantId, name: dto.name, graph: dto.graph })
+      .values({
+        tenantId,
+        name: dto.name,
+        graph: dto.graph,
+        version: (latest?.version ?? 0) + 1,
+        status: 'DRAFT',
+      })
       .returning();
     return def;
+  }
+
+  /**
+   * Puts a draft into service, retiring whatever was published before it.
+   *
+   * **This is the whole of workflow versioning.** Because `approvalInstances.workflowId`
+   * references a definition *row*, and published rows are never edited, an instance started
+   * under v1 keeps evaluating v1's graph after v2 is published — with no per-instance graph
+   * snapshot and no change to instance storage. Retired definitions are never deleted for
+   * exactly that reason: live instances still point at them.
+   *
+   * Retire-then-publish runs in one transaction. Between the two statements a tenant has zero
+   * published definitions, and `startInstance` responds to that by logging a warning and
+   * leaving the invoice **unrouted** — a silent hole an invoice could fall into. The partial
+   * unique index also means the un-transactioned order would simply fail on the second write.
+   */
+  async publishDefinition(tenantId: string, id: string) {
+    const def = await this.getDefinition(tenantId, id);
+
+    if (def.status === 'PUBLISHED') return def;
+    if (def.status === 'RETIRED') {
+      throw new BadRequestException(
+        'A retired definition cannot be republished — copy it into a new draft instead, so the ' +
+          'version history stays a straight line.',
+      );
+    }
+
+    // Re-validate at publish time, not only at creation: this is the last gate before the
+    // graph starts routing real money.
+    validateGraph(def.graph as WorkflowGraph);
+
+    return this.db.transaction(async (tx) => {
+      await tx
+        .update(workflowDefinitions)
+        .set({ status: 'RETIRED' })
+        .where(
+          and(
+            eq(workflowDefinitions.tenantId, tenantId),
+            eq(workflowDefinitions.status, 'PUBLISHED'),
+          ),
+        );
+
+      const [published] = await tx
+        .update(workflowDefinitions)
+        .set({ status: 'PUBLISHED' })
+        .where(eq(workflowDefinitions.id, id))
+        .returning();
+
+      return published;
+    });
+  }
+
+  /**
+   * Takes a definition out of service without replacing it. Deliberately separate from
+   * publishing: a tenant with nothing published has every new invoice left unrouted, so this
+   * is a decision someone should have to make explicitly rather than reach by accident.
+   */
+  async retireDefinition(tenantId: string, id: string) {
+    await this.getDefinition(tenantId, id);
+    const [retired] = await this.db
+      .update(workflowDefinitions)
+      .set({ status: 'RETIRED' })
+      .where(eq(workflowDefinitions.id, id))
+      .returning();
+    return retired;
   }
 
   async listDefinitions(tenantId: string) {
@@ -64,9 +151,9 @@ export class WorkflowEngineService {
     const [def] = await this.db
       .select()
       .from(workflowDefinitions)
-      .where(and(eq(workflowDefinitions.tenantId, tenantId), eq(workflowDefinitions.isActive, true)))
-      // Highest version wins, newest as tiebreak — without an explicit order, a tenant
-      // with two active definitions would get an arbitrary one.
+      .where(and(eq(workflowDefinitions.tenantId, tenantId), eq(workflowDefinitions.status, 'PUBLISHED')))
+      // A partial unique index already limits a tenant to one PUBLISHED definition, so this
+      // ordering is now belt-and-braces rather than the thing keeping selection deterministic.
       .orderBy(desc(workflowDefinitions.version), desc(workflowDefinitions.createdAt))
       .limit(1);
 
@@ -86,6 +173,87 @@ export class WorkflowEngineService {
     await this.logAudit(tenantId, invoiceId, 'APPROVAL_INSTANCE_CREATED', { workflowId: def.id });
 
     return this.advance(tenantId, instance, graph);
+  }
+
+  /** The one live instance for an invoice, or null. At most one can exist — see the schema. */
+  async findActiveInstance(invoiceId: string) {
+    const [instance] = await this.db
+      .select()
+      .from(approvalInstances)
+      .where(and(eq(approvalInstances.invoiceId, invoiceId), eq(approvalInstances.status, 'ACTIVE')));
+    return instance ?? null;
+  }
+
+  /**
+   * Withdraws the live approval instance so the invoice can be re-validated and re-routed.
+   *
+   * **Every approval already cast is discarded.** The prior steps are kept and marked
+   * CANCELLED so the history stays readable, but nothing is carried forward into the next
+   * run. That is the whole point: a recall happens because the figures the approvers were
+   * looking at have changed, and an approval given against different numbers is not an
+   * approval of these ones. Carrying votes forward would let an invoice reach APPROVED on a
+   * decision nobody made about its current contents.
+   *
+   * Terminal states refuse. Posting hands the accounting document to the ERP, so there is
+   * nothing here left to recall — the correct response to a posted-in-error invoice is a
+   * credit note or an ERP-side reversal, which this tool cannot request.
+   */
+  async recallInstance(tenantId: string, invoiceId: string, reason: string) {
+    const [invoice] = await this.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.id, invoiceId), eq(invoices.tenantId, tenantId)));
+    if (!invoice) throw new NotFoundException('Invoice not found');
+
+    if (invoice.status === 'POSTED' || invoice.status === 'PAID') {
+      throw new ConflictException(
+        `Invoice is ${invoice.status}: the ERP holds the accounting document, so approval ` +
+          'cannot be recalled. Raise a credit note or an ERP-side reversal instead.',
+      );
+    }
+
+    const instance = await this.findActiveInstance(invoiceId);
+    if (!instance) return null; // nothing live to recall — not an error, just a no-op
+
+    const cancelled = await this.db
+      .update(approvalSteps)
+      .set({ status: 'CANCELLED', actedAt: new Date() })
+      .where(and(eq(approvalSteps.instanceId, instance.id), eq(approvalSteps.status, 'PENDING')))
+      .returning({ id: approvalSteps.id });
+
+    // Frees the partial unique index so a replacement instance can be inserted.
+    await this.db
+      .update(approvalInstances)
+      .set({ status: 'SUPERSEDED', reason, completedAt: new Date() })
+      .where(eq(approvalInstances.id, instance.id));
+
+    await this.logAudit(tenantId, invoiceId, 'APPROVAL_INSTANCE_RECALLED', {
+      instanceId: instance.id,
+      reason,
+      cancelledSteps: cancelled.length,
+    });
+
+    return instance;
+  }
+
+  /**
+   * Starts a fresh instance after a recall and records the lineage both ways, so the
+   * invoice's history reads as a chain rather than as unrelated attempts.
+   */
+  async restartInstance(tenantId: string, invoiceId: string, reason: string) {
+    const superseded = await this.recallInstance(tenantId, invoiceId, reason);
+    const started = await this.startInstance(tenantId, invoiceId);
+
+    if (superseded && started) {
+      const fresh = await this.findActiveInstance(invoiceId);
+      if (fresh) {
+        await this.db
+          .update(approvalInstances)
+          .set({ supersededByInstanceId: fresh.id })
+          .where(eq(approvalInstances.id, superseded.id));
+      }
+    }
+    return started;
   }
 
   /**
@@ -289,7 +457,7 @@ export class WorkflowEngineService {
         and(
           eq(workflowDefinitions.tenantId, tenantId),
           eq(approvalSteps.status, 'PENDING'),
-          isNull(approvalInstances.completedAt),
+          eq(approvalInstances.status, 'ACTIVE'),
           lt(approvalSteps.slaDueAt, new Date()),
           // The dashboard wants every overdue step; the escalation sweep wants only the
           // ones it hasn't already acted on, or it re-fires every tick forever.
@@ -399,7 +567,7 @@ export class WorkflowEngineService {
       .where(
         and(
           eq(approvalSteps.status, 'PENDING'),
-          isNull(approvalInstances.completedAt),
+          eq(approvalInstances.status, 'ACTIVE'),
           lt(approvalSteps.slaDueAt, new Date()),
           isNull(approvalSteps.slaBreachedAt),
         ),
@@ -486,7 +654,7 @@ export class WorkflowEngineService {
   ) {
     await this.db
       .update(approvalInstances)
-      .set({ currentNodeId: node.id, completedAt: new Date() })
+      .set({ currentNodeId: node.id, status: 'COMPLETED', completedAt: new Date() })
       .where(eq(approvalInstances.id, instance.id));
 
     const [invoice] = await this.db
@@ -519,15 +687,34 @@ export class WorkflowEngineService {
       .where(and(eq(invoices.id, invoiceId), eq(invoices.tenantId, tenantId)));
     if (!invoice) throw new NotFoundException('Invoice not found');
 
+    // An invoice can now have several instances across its life. The live one is what a
+    // client means by "the approval"; ordering by createdAt makes a completed invoice still
+    // return its final run rather than an early superseded attempt.
     const [instance] = await this.db
       .select()
       .from(approvalInstances)
-      .where(eq(approvalInstances.invoiceId, invoiceId));
+      .where(eq(approvalInstances.invoiceId, invoiceId))
+      .orderBy(desc(approvalInstances.createdAt))
+      .limit(1);
     if (!instance) throw new NotFoundException('No approval instance for this invoice');
 
     const steps = await this.db.select().from(approvalSteps).where(eq(approvalSteps.instanceId, instance.id));
 
-    return { ...instance, steps };
+    // Prior attempts, newest first, so a caller can show why this invoice was re-run.
+    const history = await this.db
+      .select({
+        id: approvalInstances.id,
+        status: approvalInstances.status,
+        reason: approvalInstances.reason,
+        workflowId: approvalInstances.workflowId,
+        createdAt: approvalInstances.createdAt,
+        completedAt: approvalInstances.completedAt,
+      })
+      .from(approvalInstances)
+      .where(eq(approvalInstances.invoiceId, invoiceId))
+      .orderBy(desc(approvalInstances.createdAt));
+
+    return { ...instance, steps, attempts: history };
   }
 
   /**
@@ -560,7 +747,7 @@ export class WorkflowEngineService {
           eq(invoices.tenantId, tenantId),
           eq(approvalSteps.approverId, approverId),
           eq(approvalSteps.status, 'PENDING'),
-          isNull(approvalInstances.completedAt),
+          eq(approvalInstances.status, 'ACTIVE'),
         ),
       )
       .orderBy(approvalSteps.slaDueAt);
@@ -603,10 +790,13 @@ export class WorkflowEngineService {
    * the question people actually ask.
    */
   async getApprovalProgress(tenantId: string, invoiceId: string) {
+    // Progress describes the run in flight, so superseded attempts must not be picked up.
     const [instance] = await this.db
       .select()
       .from(approvalInstances)
-      .where(eq(approvalInstances.invoiceId, invoiceId));
+      .where(eq(approvalInstances.invoiceId, invoiceId))
+      .orderBy(desc(approvalInstances.createdAt))
+      .limit(1);
     if (!instance) return null;
 
     const [def] = await this.db

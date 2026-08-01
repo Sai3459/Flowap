@@ -59,6 +59,10 @@ npm install
 export DATABASE_URL="postgresql://postgres:<password>@localhost:5432/invoice_platform"
 export EXTRACTION_SERVICE_URL="http://localhost:8001"
 npx drizzle-kit push --force   # applies schema — see src/db/schema.ts
+# On a database that predates the supersede model, run this FIRST instead: `push` cannot swap
+# a UNIQUE constraint for a partial index, and stops to ask whether is_active -> status is a
+# rename. A fresh database needs neither.
+#   psql "$DATABASE_URL" -f drizzle/0001_supersede_model.sql
 npm run db:seed                # tenants, users, GL/cost centres, PO-5000, workflow definitions
 npx ts-node src/main.ts        # NOT npx tsx
 
@@ -90,8 +94,8 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ## Tests
 
 ```bash
-cd backend && npm test               # 100 unit tests — no DB, no server
-cd backend && npm run test:integration   # 27 integration tests — needs DATABASE_URL
+cd backend && npm test               # 103 unit tests — no DB, no server
+cd backend && npm run test:integration   # 36 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -211,7 +215,7 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  100 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  103 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
   `correctionBlockedByApproval`), and the fixture drift guard.
@@ -231,13 +235,15 @@ node — there's a regression test for exactly that.
     classes with constructor injection, so `@nestjs/testing` buys nothing. Only the extractor
     is stubbed; matching, workflow traversal, coding, posting and the audit trail are all
     production code against real Postgres.
-  - **27 integration tests** (`*.int-spec.ts`) over the paths that were previously
+  - **36 integration tests** (`*.int-spec.ts`) over the paths that were previously
     hand-verified only: the nine ingestion scenarios end to end, net-vs-net PO comparison,
     duplicate detection, late-PO re-validation, workflow traversal, ALL/ANY node semantics,
     sibling skipping, delegation not deadlocking an ALL node, SLA inheritance on handoff, the
-    approver check, and tenant isolation on both reads and PO matching. Two are labelled
-    `DOCUMENTS:` — they assert *current* behaviour for the known double-advance race and the
-    UNIQUE-instance constraint, so those gaps are measured rather than remembered.
+    approver check, tenant isolation on both reads and PO matching, the supersede/recall
+    lifecycle, and definition versioning. One is still labelled `DOCUMENTS:` — it asserts
+    *current* behaviour for the known double-advance race, so the gap is measured rather than
+    remembered. (The second such test, for the UNIQUE-instance constraint, became a real
+    assertion when supersede landed.)
   - **Scenario fixtures** (`src/test-support/fixtures.ts`) — the nine mock documents as typed
     TypeScript. They exist twice (here and in `mock_server.py`) because the Python one drives
     the live system and the frontend; `fixtures.spec.ts` parses the Python source and fails if
@@ -286,11 +292,36 @@ node — there's a regression test for exactly that.
   `POST /invoices/:id/revalidate`, which forces past the confidence gate. A late PO sync also
   re-validates every `EXCEPTION` invoice citing that PO number, so an invoice that arrived
   before its order clears itself. Verified live end to end for all of these.
-- **Corrections are refused mid-approval** when the field feeds a validation check
-  (409, `correctionBlockedByApproval`). Accepting one would leave the invoice showing variance
-  measured against a PO it no longer cites while parked in a workflow branch chosen because of
-  that variance; clearing the variance instead would make it read as clean in the not-clean
-  branch. Fields that feed no check (dates, reference, tax id) stay correctable throughout.
+- **Supersede / recall, and workflow definition versioning.** Two problems with one answer.
+  - `approvalInstances.invoiceId` is no longer UNIQUE. An invoice accumulates one instance per
+    attempt, and a **partial unique index** — `UNIQUE (invoice_id) WHERE status = 'ACTIVE'` —
+    keeps at most one live. The invariant is enforced by the database, so a buggy path or two
+    concurrent requests cannot produce two live instances; a careless second `startInstance()`
+    still fails, exactly as it did under the old constraint.
+  - `recallInstance()` marks the live instance `SUPERSEDED`, cancels its `PENDING` steps
+    (`CANCELLED`, distinct from `SKIPPED` — "the question was withdrawn" vs "someone else
+    answered"), and records a reason. `restartInstance()` then starts a fresh one and sets
+    `supersededByInstanceId`, so `GET /approvals/:invoiceId` returns an `attempts` chain.
+  - **Every approval already cast is discarded.** Prior steps stay visible as history but
+    nothing carries forward. A recall happens because the figures the approvers saw have
+    changed, and an approval given against different numbers is not an approval of these ones.
+  - **Definitions are immutable once published.** `POST /workflow-definitions` creates a
+    `DRAFT` at the next version for that name; `POST /:id/publish` retires the prior published
+    row and publishes this one **in one transaction**. Because `approvalInstances.workflowId`
+    references a definition *row*, an in-flight instance keeps evaluating the graph it started
+    under — with no per-instance graph snapshot and no change to instance storage. Retired
+    definitions are never deleted, because live instances still point at them. A partial unique
+    index allows only one `PUBLISHED` definition per tenant.
+  - Verified through the HTTP API, not only in tests: a 15% price-variance invoice parked at
+    the controller, its PO corrected mid-approval (previously a 409), superseded and re-routed;
+    then its definition retired under it and the approval still walked the *old* graph to
+    APPROVED while a new invoice took the newly published one.
+- **Corrections mid-approval now recall instead of refusing.** A correction to a
+  check-feeding field withdraws the running instance, re-validates, and starts a fresh one.
+  What is still refused (409, `correctionBlockedByPosting`) is a **posted** invoice: the ERP
+  holds the accounting document, so the answer there is a credit note or an ERP-side reversal.
+  Fields that feed no check (dates, reference, tax id) stay correctable throughout, even after
+  posting.
 - **Two outcomes, deliberately different** (see `runValidation`'s doc comment): *hard stops*
   (duplicate, PO not found, currency mismatch, over-receipt) park at `EXCEPTION` with no
   approval instance; *variances* record an exception **and still start the workflow**, because
@@ -472,17 +503,11 @@ customers a way to break their own tenant.
   `instanceId+nodeId+approverId`) is the fix.
 - **No cycle detection in `validateGraph`.** A graph whose edges loop back would make
   `advance()` spin. Well-formed graphs from the builder won't, but hand-authored jsonb could.
-- **Definitions can be created and read, but not updated or deactivated via the API.**
-  There is no PATCH/PUT/DELETE on `/workflow-definitions` — changing or retiring a
-  definition currently means touching the DB directly (that's how the `isActive` flag got
-  flipped during testing). `createDefinition` also never sets `version`, so every
-  definition is version 1 and `startInstance()`'s version ordering never actually
-  discriminates; publishing a v2 needs an endpoint that increments it and deactivates the
-  prior row.
-- **Running instances re-read their definition's graph on every decision.** `decideStep`
-  loads the definition fresh rather than snapshotting the graph onto the instance, so a
-  graph edited underneath an in-flight instance changes that instance's remaining path.
-  Pinning the graph (or the `version`) per instance is the safer model.
+- **There is still no editor, only an API.** Definitions are created as raw graph jsonb over
+  HTTP and published by id. The visual builder is Phase 1 config-plane work.
+- **A tenant with nothing published silently drops invoices.** `startInstance()` logs a warning
+  and leaves the invoice unrouted. `retireDefinition` can reach that state deliberately, and
+  nothing yet surfaces it as an alert or blocks the retire.
 
 ### Known gaps in PO matching / master data
 - **There is no ERP connector behind the PO API.** POs have to be pushed in by whatever calls
@@ -491,12 +516,10 @@ customers a way to break their own tenant.
   it idempotently, but that connector does not exist.
 - **No PO is ever closed or cancelled.** There is no status on `purchaseOrders`, so a fully
   consumed or cancelled order still matches new invoices exactly as an open one does.
-- **An in-flight invoice cannot be re-validated.** `approvalInstances.invoiceId` is UNIQUE and
-  there is no supersede/recall model, so once an invoice is in an approval flow its match
-  conclusions are frozen. The current answer is to refuse the correction (409) and tell the
-  user to reject the invoice; a proper recall — cancel the instance, keep its audit trail,
-  re-validate, start a fresh one — needs the unique constraint replaced with a
-  current-instance concept.
+- **Recall is not gated by a role.** `POST /invoices/:id/revalidate` and any correction that
+  triggers one will recall an in-flight approval for whoever calls it. Restricting that to
+  AP_MANAGER/CONTROLLER is meaningless until identity comes from a session rather than a
+  client-supplied id — it lands with Phase 1 auth.
 - **Re-validation is not transactional.** It clears the match state, resolves exceptions, then
   re-runs validation as separate statements; a crash midway leaves the invoice with its old
   exceptions resolved and no new match.

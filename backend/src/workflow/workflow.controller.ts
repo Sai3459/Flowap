@@ -23,6 +23,23 @@ export class WorkflowDefinitionsController {
   getOne(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
     return this.workflowEngine.getDefinition(tenantId, id);
   }
+
+  /**
+   * Puts a draft into service and retires the previous published version, in one transaction.
+   * There is deliberately no PATCH: a published definition is immutable, so changing a
+   * workflow means creating a new draft and publishing that. This is what lets an in-flight
+   * instance keep running the graph it started under.
+   */
+  @Post(':id/publish')
+  publish(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+    return this.workflowEngine.publishDefinition(tenantId, id);
+  }
+
+  /** Takes a definition out of service without replacing it — new invoices go unrouted. */
+  @Post(':id/retire')
+  retire(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+    return this.workflowEngine.retireDefinition(tenantId, id);
+  }
 }
 
 @ApiTags('approvals')

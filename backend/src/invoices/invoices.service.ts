@@ -75,31 +75,36 @@ export const CORRECTABLE_FIELDS: Record<string, CorrectableField> = {
   totalAmount: { parse: (raw) => parseMoneyOrThrow(raw, 'totalAmount') },
 };
 
-/** Statuses from which re-running validation is meaningful. */
-const REVALIDATABLE_STATUSES = ['EXCEPTION', 'NEEDS_REVIEW'] as const;
+/**
+ * Statuses from which re-running validation is meaningful.
+ *
+ * PENDING_APPROVAL is now included: with a supersede model, re-validating an in-flight
+ * invoice recalls its instance rather than colliding with the old UNIQUE constraint.
+ * APPROVED is included too — nothing external has happened until the invoice posts, and
+ * catching a bad match after approval but before posting is exactly when it is cheapest to
+ * fix. POSTED and PAID are absent on purpose: the ERP holds the document by then.
+ */
+const REVALIDATABLE_STATUSES = ['EXCEPTION', 'NEEDS_REVIEW', 'PENDING_APPROVAL', 'APPROVED'] as const;
 
 /**
  * Decides whether a re-validation should actually run, given where the invoice currently is.
  * Pure so the rules are testable without a database.
  *
- * The hard constraint is `hasApprovalInstance`: `approvalInstances.invoiceId` is UNIQUE, so
- * re-running validation on an invoice already in an approval flow would attempt a second
- * instance and blow up on the constraint. Beyond that, an invoice being actively approved
- * shouldn't have its approval silently restarted because someone fixed a date.
+ * `hasActiveApproval` no longer blocks: it now reports that a recall will be needed, so the
+ * caller can withdraw the running instance first. It used to be a hard stop because
+ * `approvalInstances.invoiceId` was UNIQUE and a second instance would violate it.
  */
 export function revalidationDecision(params: {
   status: string;
-  hasApprovalInstance: boolean;
+  hasActiveApproval: boolean;
   outstandingReviewFields: string[];
   force: boolean;
-}): { proceed: boolean; reason: string } {
-  const { status, hasApprovalInstance, outstandingReviewFields, force } = params;
+}): { proceed: boolean; reason: string; recallRequired: boolean } {
+  const { status, hasActiveApproval, outstandingReviewFields, force } = params;
+  const recallRequired = hasActiveApproval;
 
-  if (hasApprovalInstance) {
-    return { proceed: false, reason: 'invoice already has an approval instance' };
-  }
   if (!REVALIDATABLE_STATUSES.includes(status as (typeof REVALIDATABLE_STATUSES)[number])) {
-    return { proceed: false, reason: `status ${status} is not re-validatable` };
+    return { proceed: false, reason: `status ${status} is not re-validatable`, recallRequired: false };
   }
   // An automatic re-validation respects the confidence gate; an explicit request from a human
   // overrides it, which is the only way an invoice held by a low-confidence *line item* can
@@ -108,26 +113,30 @@ export function revalidationDecision(params: {
     return {
       proceed: false,
       reason: `still awaiting review of: ${outstandingReviewFields.join(', ')}`,
+      recallRequired: false,
     };
   }
-  return { proceed: true, reason: force ? 'forced' : 'ready' };
+  return { proceed: true, reason: force ? 'forced' : 'ready', recallRequired };
 }
 
 /**
- * Whether a correction must be refused because the invoice is mid-approval.
+ * Whether a correction must be refused outright.
  *
- * Only fields that feed a validation check are blocked. Accepting one would leave the invoice
- * showing conclusions drawn from the previous value — variance measured against a PO it no
- * longer cites — while sitting in a workflow branch chosen because of that variance. Clearing
- * the variance instead would be worse: the invoice would read as clean while parked in the
- * not-clean branch. Re-validating is impossible too, since `approvalInstances.invoiceId` is
- * UNIQUE and there is no supersede/recall model for an in-flight approval.
+ * This used to refuse any correction to a check-feeding field while an approval was in
+ * flight, because there was nowhere for the re-validation to go: `approvalInstances.invoiceId`
+ * was UNIQUE with no supersede model. With recall in place that is no longer true — a
+ * mid-approval correction now withdraws the running instance, re-validates, and starts a
+ * fresh one, discarding the approvals cast against the old figures.
+ *
+ * What remains genuinely blocked is a **posted** invoice. The ERP holds the accounting
+ * document at that point, so re-validating here would put the two systems out of step; the
+ * correct response is a credit note or an ERP-side reversal, which this tool cannot request.
  */
-export function correctionBlockedByApproval(params: {
+export function correctionBlockedByPosting(params: {
   revalidates: boolean;
-  hasActiveApproval: boolean;
+  invoiceStatus: string;
 }): boolean {
-  return params.revalidates && params.hasActiveApproval;
+  return params.revalidates && (params.invoiceStatus === 'POSTED' || params.invoiceStatus === 'PAID');
 }
 
 /** Names of fields sitting below the review threshold, read out of the fieldConfidence blob. */
@@ -311,14 +320,11 @@ export class InvoicesService {
       .where(and(eq(invoices.id, invoiceId), eq(invoices.tenantId, tenantId)));
     if (!invoice) throw new NotFoundException('Invoice not found');
 
-    const [existingInstance] = await this.db
-      .select({ id: approvalInstances.id })
-      .from(approvalInstances)
-      .where(eq(approvalInstances.invoiceId, invoiceId));
+    const activeInstance = await this.workflowEngine.findActiveInstance(invoiceId);
 
     const decision = revalidationDecision({
       status: invoice.status,
-      hasApprovalInstance: Boolean(existingInstance),
+      hasActiveApproval: Boolean(activeInstance),
       outstandingReviewFields: await this.outstandingReviewFields(invoiceId, invoice.fieldConfidence),
       force: opts.force ?? false,
     });
@@ -333,6 +339,17 @@ export class InvoicesService {
         status: invoice.status,
       });
       return { revalidated: false, reason: decision.reason, invoice: await this.findOne(tenantId, invoiceId) };
+    }
+
+    // Withdraw the running approval before touching the match state, so the invoice is never
+    // briefly parked in a workflow branch chosen by conclusions that have just been erased.
+    // Every approval already cast is discarded — see `recallInstance`.
+    if (decision.recallRequired) {
+      await this.workflowEngine.recallInstance(
+        tenantId,
+        invoiceId,
+        opts.force ? 're-validated on explicit request' : 're-validated after a field correction',
+      );
     }
 
     await this.clearMatchState(invoiceId);
@@ -645,30 +662,17 @@ export class InvoicesService {
       );
     }
 
-    // A field that feeds validation cannot be changed once the invoice is in an approval
-    // flow. Accepting it would leave the invoice displaying conclusions drawn from the old
-    // value — e.g. a variance measured against a PO the invoice no longer cites — while it
-    // sits in a workflow branch chosen because of that variance. Re-validating instead is
-    // not possible either: approvalInstances.invoiceId is UNIQUE and there is no
-    // supersede/recall model for an in-flight approval (see CLAUDE.md).
-    if (spec.revalidates) {
-      const [instance] = await this.db
-        .select({ id: approvalInstances.id, completedAt: approvalInstances.completedAt })
-        .from(approvalInstances)
-        .where(eq(approvalInstances.invoiceId, invoiceId));
-
-      const blocked = correctionBlockedByApproval({
-        revalidates: true,
-        hasActiveApproval: Boolean(instance) && !instance?.completedAt,
-      });
-
-      if (blocked) {
-        throw new ConflictException(
-          `"${dto.fieldName}" feeds duplicate and purchase-order matching, so it cannot be changed ` +
-            'while this invoice is in an approval flow — the recorded match would no longer describe ' +
-            'the invoice. Reject the invoice to send it back, or correct it after the approval completes.',
-        );
-      }
+    // A field that feeds validation can now be corrected mid-approval: the re-validation
+    // below recalls the running instance and starts a fresh one, so the invoice can never be
+    // left displaying a match that no longer describes it while parked in a branch chosen
+    // because of that match. What is still refused is a posted invoice — the ERP holds the
+    // accounting document, so there is nothing left here to re-decide.
+    if (correctionBlockedByPosting({ revalidates: spec.revalidates ?? false, invoiceStatus: invoice.status })) {
+      throw new ConflictException(
+        `"${dto.fieldName}" feeds duplicate and purchase-order matching, so it cannot be changed ` +
+          `once the invoice is ${invoice.status} — the ERP already holds the accounting document. ` +
+          'Raise a credit note or an ERP-side reversal instead.',
+      );
     }
 
     const value = spec.parse(dto.correctedValue);

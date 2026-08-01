@@ -48,7 +48,7 @@ export class DashboardService {
             and(
               eq(invoices.tenantId, tenantId),
               eq(approvalSteps.status, 'PENDING'),
-              isNull(approvalInstances.completedAt),
+              eq(approvalInstances.status, 'ACTIVE'),
               lt(approvalSteps.slaDueAt, new Date()),
             ),
           ),

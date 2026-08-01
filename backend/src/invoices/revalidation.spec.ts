@@ -2,30 +2,35 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 import {
   CORRECTABLE_FIELDS,
-  correctionBlockedByApproval,
+  correctionBlockedByPosting,
   revalidationDecision,
 } from './invoices.service';
 
 const decide = (overrides: Partial<Parameters<typeof revalidationDecision>[0]> = {}) =>
   revalidationDecision({
     status: 'EXCEPTION',
-    hasApprovalInstance: false,
+    hasActiveApproval: false,
     outstandingReviewFields: [],
     force: false,
     ...overrides,
   });
 
-describe('revalidationDecision — approval-instance guard', () => {
-  it('refuses when an approval instance already exists', () => {
-    // approvalInstances.invoiceId is UNIQUE, so a second startInstance() would violate it.
-    // This is the hard constraint, not a policy preference.
-    const decision = decide({ hasApprovalInstance: true });
-    assert.equal(decision.proceed, false);
-    assert.match(decision.reason, /already has an approval instance/);
+describe('revalidationDecision — the recall signal', () => {
+  it('proceeds when an approval is live, and reports that a recall is needed first', () => {
+    // This used to be a hard refusal: approvalInstances.invoiceId was UNIQUE, so a second
+    // startInstance() would violate it. With the supersede model the live instance is
+    // withdrawn instead, and every approval cast against the old figures is discarded.
+    const decision = decide({ status: 'PENDING_APPROVAL', hasActiveApproval: true });
+    assert.equal(decision.proceed, true);
+    assert.equal(decision.recallRequired, true);
   });
 
-  it('refuses even when forced, because the constraint is not overridable', () => {
-    assert.equal(decide({ hasApprovalInstance: true, force: true }).proceed, false);
+  it('does not ask for a recall when nothing is live', () => {
+    assert.equal(decide({ status: 'EXCEPTION' }).recallRequired, false);
+  });
+
+  it('refuses a POSTED invoice outright — the ERP holds the document', () => {
+    assert.equal(decide({ status: 'POSTED', force: true }).proceed, false);
   });
 });
 
@@ -38,8 +43,20 @@ describe('revalidationDecision — status gate', () => {
     assert.equal(decide({ status: 'NEEDS_REVIEW', outstandingReviewFields: [] }).proceed, true);
   });
 
+  it('proceeds from PENDING_APPROVAL and APPROVED, which recall made reachable', () => {
+    // Both used to be refused because a second instance would violate UNIQUE(invoice_id).
+    // APPROVED is included deliberately: nothing external has happened until the invoice
+    // posts, and catching a bad match in that window is when it is cheapest to fix.
+    for (const status of ['PENDING_APPROVAL', 'APPROVED']) {
+      assert.equal(decide({ status }).proceed, true, `expected ${status} to be re-validatable`);
+    }
+  });
+
   it('refuses from statuses where re-validating makes no sense', () => {
-    for (const status of ['PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'POSTED', 'PAID', 'EXTRACTING']) {
+    // POSTED and PAID are the important ones: the ERP holds the accounting document, so the
+    // answer there is a credit note, not a re-run. REJECTED and EXTRACTING have simply not
+    // reached a state with conclusions worth re-drawing.
+    for (const status of ['REJECTED', 'POSTED', 'PAID', 'EXTRACTING']) {
       const decision = decide({ status });
       assert.equal(decision.proceed, false, `expected ${status} to be refused`);
       assert.match(decision.reason, /not re-validatable/);
@@ -67,24 +84,29 @@ describe('revalidationDecision — confidence gate', () => {
   });
 
   it('still applies the status gate when forced', () => {
-    assert.equal(decide({ status: 'APPROVED', force: true }).proceed, false);
+    assert.equal(decide({ status: 'POSTED', force: true }).proceed, false);
   });
 });
 
-describe('correctionBlockedByApproval', () => {
-  it('blocks a validation-feeding field while an approval is active', () => {
-    // A variance invoice sits at PENDING_APPROVAL by design, so this is the common case, not
-    // an edge one: re-pointing its PO mid-approval would leave the variance describing the
-    // old order.
-    assert.equal(correctionBlockedByApproval({ revalidates: true, hasActiveApproval: true }), true);
+describe('correctionBlockedByPosting', () => {
+  it('blocks a validation-feeding field once the invoice is POSTED', () => {
+    assert.equal(correctionBlockedByPosting({ revalidates: true, invoiceStatus: 'POSTED' }), true);
   });
 
-  it('allows a field that feeds no check even mid-approval', () => {
-    assert.equal(correctionBlockedByApproval({ revalidates: false, hasActiveApproval: true }), false);
+  it('blocks it once PAID too', () => {
+    assert.equal(correctionBlockedByPosting({ revalidates: true, invoiceStatus: 'PAID' }), true);
   });
 
-  it('allows a validation-feeding field once no approval is active', () => {
-    assert.equal(correctionBlockedByApproval({ revalidates: true, hasActiveApproval: false }), false);
+  it('allows a validation-feeding field mid-approval — this now recalls instead of refusing', () => {
+    // A variance invoice sits at PENDING_APPROVAL by design, so this is the common case. It
+    // used to 409; the correction now withdraws the running instance and re-routes.
+    assert.equal(correctionBlockedByPosting({ revalidates: true, invoiceStatus: 'PENDING_APPROVAL' }), false);
+  });
+
+  it('allows a field that feeds no check even on a posted invoice', () => {
+    // Dates and reference numbers change nothing a check reads, so there is nothing to
+    // re-decide and no disagreement with the ERP to create.
+    assert.equal(correctionBlockedByPosting({ revalidates: false, invoiceStatus: 'POSTED' }), false);
   });
 });
 
@@ -115,7 +137,7 @@ describe('CORRECTABLE_FIELDS — which corrections trigger a re-check', () => {
     assert.equal(
       revalidationDecision({
         status: 'NEEDS_REVIEW',
-        hasApprovalInstance: false,
+        hasActiveApproval: false,
         outstandingReviewFields: [],
         force: false,
       }).proceed,

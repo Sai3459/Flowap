@@ -3,7 +3,7 @@
  *
  * Before this, standing the system up meant: create a tenant by hand, read its UUID out of
  * psql, POST a purchase order, POST GL accounts and cost centres, then INSERT a workflow
- * definition as raw jsonb — and the `isActive` flag genuinely did get flipped with SQL during
+ * definition as raw jsonb — and the published flag genuinely did get flipped with SQL during
  * testing. That is not something a new developer (or a CI run) can be asked to do.
  *
  * Idempotent by natural key, so it is safe to re-run against a database that already has
@@ -238,12 +238,18 @@ async function seedPurchaseOrders(db: Db, tenantId: string) {
   }
 }
 
+/**
+ * Seeding writes definitions directly rather than going through `publishDefinition`, because
+ * a seed has to be idempotent and publishing is a state transition — running it twice would
+ * retire the definition it just published. Only one is seeded PUBLISHED, which the partial
+ * unique index enforces anyway.
+ */
 async function upsertWorkflow(
   db: Db,
   tenantId: string,
   name: string,
   graph: unknown,
-  isActive: boolean,
+  status: 'DRAFT' | 'PUBLISHED' | 'RETIRED',
 ) {
   const [existing] = await db
     .select()
@@ -253,13 +259,13 @@ async function upsertWorkflow(
   if (existing) {
     await db
       .update(workflowDefinitions)
-      .set({ graph, isActive })
+      .set({ graph, status })
       .where(eq(workflowDefinitions.id, existing.id));
     return existing.id;
   }
   const [created] = await db
     .insert(workflowDefinitions)
-    .values({ tenantId, name, graph, isActive })
+    .values({ tenantId, name, graph, status })
     .returning();
   return created.id;
 }
@@ -286,9 +292,9 @@ export async function seed(db: Db) {
 
   // Only one is active: `startInstance()` picks the active definition, so seeding two active
   // ones would make which graph an invoice gets depend on row order.
-  await upsertWorkflow(db, tenantId, 'Variance-based routing', varianceRoutingGraph(), true);
-  await upsertWorkflow(db, tenantId, 'Standard AP Approval', amountRoutingGraph(managerOne, managerTwo), false);
-  await upsertWorkflow(db, tenantId, 'SLA Escalation Workflow', slaEscalationGraph(managerOne), false);
+  await upsertWorkflow(db, tenantId, 'Variance-based routing', varianceRoutingGraph(), 'PUBLISHED');
+  await upsertWorkflow(db, tenantId, 'Standard AP Approval', amountRoutingGraph(managerOne, managerTwo), 'DRAFT');
+  await upsertWorkflow(db, tenantId, 'SLA Escalation Workflow', slaEscalationGraph(managerOne), 'DRAFT');
 
   return { tenantId, otherTenantId, userIds };
 }

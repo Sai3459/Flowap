@@ -92,7 +92,17 @@ export const users = pgTable('users', {
 export const vendors = pgTable('vendors', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  /** As printed on the document — kept for display, never used for matching. */
   name: text('name').notNull(),
+  /**
+   * `normaliseVendorName(name)` — the identity key. Accents, case, punctuation and legal-form
+   * suffixes stripped, so "Arena Media Comunicaciones España, S.A." and
+   * "ARENA MEDIA COMUNICACIONES ESPANA SA" resolve to one vendor.
+   *
+   * This is load-bearing for money: duplicate detection gates on `vendorId`, so fragmenting a
+   * vendor silently disables it and the same invoice can be paid twice.
+   */
+  normalisedName: text('normalised_name').notNull(),
   taxId: text('tax_id'),
   email: text('email'),
   bankDetails: jsonb('bank_details'),
@@ -100,9 +110,10 @@ export const vendors = pgTable('vendors', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantIdx: index('vendors_tenant_idx').on(t.tenantId),
-  // Lets ingestion upsert a vendor by name without two concurrent invoices from the
-  // same vendor racing to create duplicate rows.
-  tenantNameUnique: unique().on(t.tenantId, t.name),
+  // Uniqueness moved to the normalised key: two concurrent ingests of differently-spelled
+  // versions of one supplier now collide and resolve to the same row, instead of racing to
+  // create two.
+  tenantNormalisedUnique: unique().on(t.tenantId, t.normalisedName),
 }));
 
 export const purchaseOrders = pgTable('purchase_orders', {
@@ -324,6 +335,33 @@ export const approvalSteps = pgTable('approval_steps', {
   actedAt: timestamp('acted_at'),
 }, (t) => ({
   instanceIdx: index('approval_steps_instance_idx').on(t.instanceId),
+}));
+
+/**
+ * One row per email message the poller has handled.
+ *
+ * Exists so a re-poll cannot re-ingest. IMAP's \Seen flag is not enough on its own: a crash
+ * between storing an attachment and marking the message read would re-deliver it, and a
+ * second copy of a supplier's invoice is a duplicate payment risk rather than a cosmetic
+ * annoyance. The unique key is what makes the poll idempotent; the flag is just an
+ * optimisation on top.
+ */
+export const inboundMessages = pgTable('inbound_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  /** RFC 5322 Message-ID as the sender wrote it. */
+  messageId: text('message_id').notNull(),
+  fromAddress: text('from_address'),
+  subject: text('subject'),
+  receivedAt: timestamp('received_at'),
+  /** How many attachments became invoices — 0 is normal and worth recording. */
+  invoicesCreated: integer('invoices_created').notNull().default(0),
+  /** Per-attachment outcomes, including why anything was skipped. */
+  outcome: jsonb('outcome'),
+  processedAt: timestamp('processed_at').defaultNow().notNull(),
+}, (t) => ({
+  tenantMessageUnique: unique().on(t.tenantId, t.messageId),
+  tenantIdx: index('inbound_messages_tenant_idx').on(t.tenantId),
 }));
 
 export const erpConnections = pgTable('erp_connections', {

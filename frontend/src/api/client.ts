@@ -5,6 +5,7 @@ import type {
   DashboardSummary,
   ExceptionQueueItem,
   GlAccount,
+  InboundMessage,
   InboxItem,
   InvoiceDetail,
   InvoiceListItem,
@@ -81,6 +82,15 @@ export const api = {
 
   // --- invoices ---
   listInvoices: () => request<InvoiceListItem[]>('/invoices'),
+
+  /** What has arrived by email, and what was skipped and why. */
+  inboundMessages: () => request<InboundMessage[]>('/inbound/messages'),
+  /** Sweeps the mailbox now instead of waiting for the cron. */
+  pollInbound: () =>
+    request<{ configured?: false; reason?: string; fetched?: number; invoicesCreated?: number }>(
+      '/inbound/poll',
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
   getInvoice: (id: string) => request<InvoiceDetail>(`/invoices/${id}`),
   listExceptions: () => request<ExceptionQueueItem[]>('/invoices/exceptions'),
   correctField: (invoiceId: string, fieldName: string, correctedValue: string) =>

@@ -94,8 +94,8 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ## Tests
 
 ```bash
-cd backend && npm test               # 118 unit tests — no DB, no server
-cd backend && npm run test:integration   # 45 integration tests — needs DATABASE_URL
+cd backend && npm test               # 142 unit tests — no DB, no server
+cd backend && npm run test:integration   # 53 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -219,6 +219,43 @@ node — there's a regression test for exactly that.
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
   `correctionBlockedByApproval`), and the fixture drift guard.
+- **Email inbound** (`src/inbound/`) — the channel that makes "touchless" true at the front
+  door. Until this, an invoice entered because a person dragged a PDF into a browser, which
+  meant a human touched every document at the exact moment we claimed not to need one; in real
+  AP the great majority arrive at an `ap@` mailbox.
+  Each accepted attachment is stored and handed to the pipeline **by URL** — the same path an
+  upload or a connector push takes, so there is no second ingestion route to keep in step.
+  - **Ordering is deliberate**: store and ingest first, record the message second, mark it read
+    last. A crash therefore produces a duplicate *attempt*, absorbed by the unique key on
+    `(tenantId, messageId)` — whereas marking read first would lose a supplier's invoice
+    outright. Retrying beats losing.
+  - `decideAttachments()` is pure and tested: takes PDF/PNG/JPEG/WebP, skips Office documents,
+    and skips Outlook signature images **by filename pattern rather than size**, so a
+    genuinely tiny scan is not thrown away with the logos. Every skip is recorded with a
+    reason — an operator asking "where is my invoice?" needs to see it arrived and why nothing
+    came of it.
+  - `GET /inbound/messages`, `POST /inbound/poll` (sweep now), a 5-minute cron, and an
+    "Arrived by email" panel on the Upload screen.
+  - ⚠️ **The IMAP transport has never opened a socket** — no mail server exists in this
+    sandbox. Everything that *decides* anything sits behind the `MailboxSource` interface and
+    is proven against a fake mailbox (8 integration tests, using the real Arena Media PDF
+    bytes, asserting byte-for-byte storage and that a re-delivered message cannot become a
+    second invoice). `ImapMailboxSource` itself is the unproven part.
+  - Config is per-process (`INBOUND_IMAP_*`) and belongs in per-tenant config with the
+    password in a secret store; that arrives with the config plane.
+- **Vendor identity is a normalised key, not the printed name** (`src/vendors/vendor-name.ts`).
+  This was a money bug: duplicate detection gates on `vendorId`, so a supplier fragmented
+  across spellings silently disabled it and the same invoice could be paid twice. The live
+  database already had it — "Arena Media Comunicaciones Espana, S.A." and
+  "…España, S.A." were two rows for one company.
+  `normaliseVendorName()` strips accents, case, punctuation, dotted abbreviations (`S.A.` →
+  `sa`) and trailing legal forms, and uniqueness moved to `(tenantId, normalisedName)`.
+  Deliberately **not** fuzzy matching — "Acme Supplies" and "Acme Supply Co" stay separate,
+  because merging two real suppliers points payments at the wrong bank account. Aggressive on
+  noise, conservative on meaning.
+  `drizzle/0002_vendor_normalisation.sql` backfills *and merges*: it repoints invoices and
+  POs at one winning row per key before deleting the losers. Verified on the live database —
+  three fragments merged into one, the invoice repointed, zero orphans.
 - **Locale-correct field parsing** (`parseDateOrThrow`, `parseMoneyOrThrow`) — found by the
   first two real invoices, both of which the previous parsers got wrong:
   - `new Date('04/05/2026')` returned **5 April** for a Spanish invoice dated **4 May**. Wrong

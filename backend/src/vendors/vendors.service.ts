@@ -3,6 +3,7 @@ import { ApiHeader, ApiTags } from '@nestjs/swagger';
 import { and, eq } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { users, vendors } from '../db/schema';
+import { normaliseVendorName } from './vendor-name';
 
 /**
  * Shared vendor resolution. Both invoice ingestion and purchase-order sync need to turn a
@@ -18,27 +19,38 @@ export class VendorsService {
   }
 
   /**
-   * Upserts by (tenantId, name) and returns the vendor id. Null for a blank name.
+   * Upserts by the *normalised* name and returns the vendor id. Null for a blank or
+   * unnameable vendor.
    *
-   * Matching is exact-name after trimming. Real vendor resolution needs fuzzy matching plus
-   * tax-id and bank-detail verification — "Acme Inc." and "Acme, Inc" become two vendors
-   * here, and duplicate detection keys on vendorId so it won't relate their invoices.
+   * Matching used to be exact-name-after-trim, which fragmented a supplier across spellings —
+   * and because duplicate detection gates on `vendorId`, a fragmented vendor silently
+   * disabled it and let the same invoice be paid twice. `normaliseVendorName` now supplies
+   * the key; the first spelling seen is kept as the display name.
+   *
+   * Still not fuzzy matching, deliberately: "Acme Supplies" and "Acme Supply Co" stay
+   * separate, because merging two real suppliers points payments at the wrong bank account.
+   * Tax-id and bank-detail corroboration is the next step up and is not written yet.
    */
   async resolveByName(tenantId: string, vendorName: string | null | undefined): Promise<string | null> {
     const name = vendorName?.trim();
     if (!name) return null;
 
-    // Relies on the unique index on (tenantId, name) so two concurrent ingests of the same
-    // vendor can't create duplicate rows.
+    const normalisedName = normaliseVendorName(name);
+    // A name of pure punctuation carries no identity. Returning null keeps every such
+    // vendor from collapsing into one shared row.
+    if (!normalisedName) return null;
+
+    // Relies on the unique index on (tenantId, normalisedName) so two concurrent ingests of
+    // differently-spelled versions of one supplier resolve to the same row rather than racing.
     await this.db
       .insert(vendors)
-      .values({ tenantId, name })
-      .onConflictDoNothing({ target: [vendors.tenantId, vendors.name] });
+      .values({ tenantId, name, normalisedName })
+      .onConflictDoNothing({ target: [vendors.tenantId, vendors.normalisedName] });
 
     const [vendor] = await this.db
       .select({ id: vendors.id })
       .from(vendors)
-      .where(and(eq(vendors.tenantId, tenantId), eq(vendors.name, name)));
+      .where(and(eq(vendors.tenantId, tenantId), eq(vendors.normalisedName, normalisedName)));
 
     return vendor?.id ?? null;
   }

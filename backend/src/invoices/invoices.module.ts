@@ -11,6 +11,6 @@ import { VendorsModule } from '../vendors/vendors.module';
   imports: [WorkflowModule, VendorsModule],
   controllers: [InvoicesController, FilesController],
   providers: [InvoicesService, ExtractionClientService, FileStorageService],
-  exports: [InvoicesService],
+  exports: [InvoicesService, FileStorageService],
 })
 export class InvoicesModule {}

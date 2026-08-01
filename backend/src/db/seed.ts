@@ -19,6 +19,7 @@ import { Pool } from 'pg';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { and, eq } from 'drizzle-orm';
 import * as schema from './schema';
+import { normaliseVendorName } from '../vendors/vendor-name';
 import {
   costCenters,
   glAccounts,
@@ -200,12 +201,19 @@ async function upsertUser(db: Db, tenantId: string, u: (typeof SEED_USERS)[numbe
 }
 
 async function upsertVendor(db: Db, tenantId: string, name: string): Promise<string> {
+  // Looked up by the normalised key, matching VendorsService — otherwise re-seeding after a
+  // spelling change would try to insert a second row and hit the unique index.
   const [existing] = await db
     .select()
     .from(vendors)
-    .where(and(eq(vendors.tenantId, tenantId), eq(vendors.name, name)));
+    .where(
+      and(eq(vendors.tenantId, tenantId), eq(vendors.normalisedName, normaliseVendorName(name))),
+    );
   if (existing) return existing.id;
-  const [created] = await db.insert(vendors).values({ tenantId, name }).returning();
+  const [created] = await db
+    .insert(vendors)
+    .values({ tenantId, name, normalisedName: normaliseVendorName(name) })
+    .returning();
   return created.id;
 }
 

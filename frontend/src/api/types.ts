@@ -223,3 +223,15 @@ export interface DashboardSummary {
     detail: unknown;
   }[];
 }
+
+/** One email the inbound poller has handled — what arrived, and what came of it. */
+export interface InboundMessage {
+  id: string;
+  messageId: string;
+  fromAddress: string | null;
+  subject: string | null;
+  receivedAt: string | null;
+  invoicesCreated: number;
+  outcome: { accepted: number; skipped: { filename: string; reason: string }[] } | null;
+  processedAt: string;
+}

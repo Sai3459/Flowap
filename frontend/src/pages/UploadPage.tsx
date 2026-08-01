@@ -1,8 +1,9 @@
 import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import type { InvoiceDetail } from '../api/types';
-import { StatusPill } from '../components/ui';
+import type { InboundMessage, InvoiceDetail } from '../api/types';
+import { Empty, ErrorNote, Loading, StatusPill } from '../components/ui';
+import { useApi } from '../lib/useApi';
 import { rectOf, useEffectsApi } from '../components/Effects';
 import { notifyInboxChanged } from '../lib/useInboxWatch';
 
@@ -104,6 +105,8 @@ export function UploadPage() {
         document you actually uploaded.
       </div>
 
+      <InboundMail />
+
       {results.length > 0 && (
         <div className="card">
           <div className="card-head"><h2>Just processed</h2><span className="lbl">{results.length} document(s)</span></div>
@@ -133,5 +136,95 @@ export function UploadPage() {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Email is the other way in — and in real AP, the main one. Drag-and-drop above is what a
+ * clerk uses for the odd document; this is the channel that makes "touchless" true, because
+ * nobody has to be present for an invoice to arrive.
+ *
+ * Shows what the poller has handled, including the messages it deliberately ignored: an
+ * operator asking "where is my invoice?" needs to see that it arrived and why nothing came
+ * of it, rather than finding an empty screen.
+ */
+function InboundMail() {
+  const { data, loading, error, reload } = useApi<InboundMessage[]>(() => api.inboundMessages());
+  const [polling, setPolling] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function pollNow() {
+    setPolling(true);
+    setNote(null);
+    try {
+      const r = await api.pollInbound();
+      setNote(
+        r.configured === false
+          ? (r.reason ?? 'Inbound mail is not configured.')
+          : `Checked the mailbox: ${r.fetched ?? 0} message(s), ${r.invoicesCreated ?? 0} invoice(s).`,
+      );
+      reload();
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPolling(false);
+    }
+  }
+
+  const rows = data ?? [];
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2>Arrived by email</h2>
+        <span className="lbl">the ap@ mailbox</span>
+      </div>
+
+      <div className="row-between">
+        <p className="dim small" style={{ maxWidth: '62ch', margin: 0 }}>
+          Attachments are stored and pushed through the same pipeline as an upload. Each message
+          is recorded once, so a re-delivered mail cannot become a second invoice.
+        </p>
+        <button disabled={polling} onClick={() => void pollNow()}>
+          {polling ? 'Checking…' : 'Check now'}
+        </button>
+      </div>
+
+      {note && <div className="notice">{note}</div>}
+      {error && <ErrorNote message={error} />}
+
+      {loading ? (
+        <Loading what="inbound mail" />
+      ) : rows.length === 0 ? (
+        <Empty>Nothing has arrived by email yet.</Empty>
+      ) : (
+        <div className="tbl-wrap">
+          <table>
+            <thead>
+              <tr><th>From</th><th>Subject</th><th className="r">Invoices</th><th>Skipped</th><th>Handled</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((m) => (
+                <tr key={m.id}>
+                  <td className="mute">{m.fromAddress ?? '—'}</td>
+                  <td className="wrap">{m.subject || <span className="mute">(no subject)</span>}</td>
+                  <td className="r">
+                    {m.invoicesCreated > 0
+                      ? <span className="pill p-clear">{m.invoicesCreated}</span>
+                      : <span className="mute">0</span>}
+                  </td>
+                  <td className="wrap dim small">
+                    {m.outcome?.skipped?.length
+                      ? m.outcome.skipped.map((s) => `${s.filename}: ${s.reason.replace(/-/g, ' ')}`).join('; ')
+                      : '—'}
+                  </td>
+                  <td className="mute">{new Date(m.processedAt).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }

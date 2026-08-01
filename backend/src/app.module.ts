@@ -6,6 +6,9 @@ import { InvoicesModule } from './invoices/invoices.module';
 import { WorkflowModule } from './workflow/workflow.module';
 import { VendorsModule } from './vendors/vendors.module';
 import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
+import { CodingModule } from './coding/coding.module';
+import { PostingModule } from './posting/posting.module';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
   imports: [
@@ -16,6 +19,9 @@ import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
     VendorsModule,
     InvoicesModule,
     PurchaseOrdersModule,
+    CodingModule,
+    PostingModule,
+    DashboardModule,
   ],
 })
 export class AppModule {}

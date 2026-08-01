@@ -13,6 +13,7 @@ import {
   auditEvents,
   invoices,
   users,
+  vendors,
   workflowDefinitions,
 } from '../db/schema';
 import { isApproveEdge, WorkflowEdge, WorkflowGraph, WorkflowNode } from './workflow-graph.types';
@@ -527,6 +528,125 @@ export class WorkflowEngineService {
     const steps = await this.db.select().from(approvalSteps).where(eq(approvalSteps.instanceId, instance.id));
 
     return { ...instance, steps };
+  }
+
+  /**
+   * The approval work queue for one person: every step still waiting on them, with enough
+   * invoice context to decide without opening each one.
+   *
+   * This is a **pull** model — there is no email or push notification telling the next
+   * approver their turn has come, so they find work by looking here. That is a real gap, and
+   * this inbox is the thing that makes it survivable rather than invisible.
+   */
+  async findPendingForApprover(tenantId: string, approverId: string) {
+    return this.db
+      .select({
+        step: approvalSteps,
+        invoiceId: invoices.id,
+        invoiceNumber: invoices.invoiceNumber,
+        totalAmount: invoices.totalAmount,
+        currency: invoices.currency,
+        poNumber: invoices.poNumber,
+        priceVariancePct: invoices.priceVariancePct,
+        quantityVariancePct: invoices.quantityVariancePct,
+        vendorName: vendors.name,
+      })
+      .from(approvalSteps)
+      .innerJoin(approvalInstances, eq(approvalSteps.instanceId, approvalInstances.id))
+      .innerJoin(invoices, eq(approvalInstances.invoiceId, invoices.id))
+      .leftJoin(vendors, eq(invoices.vendorId, vendors.id))
+      .where(
+        and(
+          eq(invoices.tenantId, tenantId),
+          eq(approvalSteps.approverId, approverId),
+          eq(approvalSteps.status, 'PENDING'),
+          isNull(approvalInstances.completedAt),
+        ),
+      )
+      .orderBy(approvalSteps.slaDueAt);
+  }
+
+  /** Everything this person has already decided — their personal approval history. */
+  async findHistoryForApprover(tenantId: string, approverId: string, limit = 100) {
+    return this.db
+      .select({
+        step: approvalSteps,
+        invoiceId: invoices.id,
+        invoiceNumber: invoices.invoiceNumber,
+        totalAmount: invoices.totalAmount,
+        currency: invoices.currency,
+        invoiceStatus: invoices.status,
+        vendorName: vendors.name,
+      })
+      .from(approvalSteps)
+      .innerJoin(approvalInstances, eq(approvalSteps.instanceId, approvalInstances.id))
+      .innerJoin(invoices, eq(approvalInstances.invoiceId, invoices.id))
+      .leftJoin(vendors, eq(invoices.vendorId, vendors.id))
+      .where(
+        and(
+          eq(invoices.tenantId, tenantId),
+          eq(approvalSteps.approverId, approverId),
+          inArray(approvalSteps.status, ['APPROVED', 'REJECTED', 'DELEGATED']),
+        ),
+      )
+      .orderBy(desc(approvalSteps.actedAt))
+      .limit(limit);
+  }
+
+  /**
+   * How much approval an invoice still needs. Walks the graph forward from where the instance
+   * is parked, counting APPROVAL nodes on the approve path, so the UI can say "2 of 3" rather
+   * than only showing the current step.
+   *
+   * Counts the optimistic path — the route taken if everyone approves. A rejection or SLA
+   * breach diverts elsewhere, so this is "how many more sign-offs if all goes well", which is
+   * the question people actually ask.
+   */
+  async getApprovalProgress(tenantId: string, invoiceId: string) {
+    const [instance] = await this.db
+      .select()
+      .from(approvalInstances)
+      .where(eq(approvalInstances.invoiceId, invoiceId));
+    if (!instance) return null;
+
+    const [def] = await this.db
+      .select()
+      .from(workflowDefinitions)
+      .where(and(eq(workflowDefinitions.id, instance.workflowId), eq(workflowDefinitions.tenantId, tenantId)));
+    if (!def) return null;
+
+    const graph = def.graph as WorkflowGraph;
+    const steps = await this.db
+      .select()
+      .from(approvalSteps)
+      .where(eq(approvalSteps.instanceId, instance.id));
+
+    const nodesDecided = new Set(
+      steps.filter((s) => s.status === 'APPROVED' || s.status === 'REJECTED').map((s) => s.nodeId),
+    );
+
+    // Walk the approve path from the current node to a terminal, counting APPROVAL nodes.
+    let remaining = 0;
+    let cursor: string | null = instance.currentNodeId;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor); // guards against a cyclic hand-authored graph
+      const node = graph.nodes.find((n) => n.id === cursor);
+      if (!node || node.type === 'END' || node.type === 'REJECT') break;
+      if (node.type === 'APPROVAL' && !nodesDecided.has(node.id)) remaining += 1;
+      const edge = graph.edges.find((e) => e.from === cursor && isApproveEdge(e));
+      cursor = edge?.to ?? null;
+    }
+
+    return {
+      workflowName: def.name,
+      currentNodeId: instance.currentNodeId,
+      completedAt: instance.completedAt,
+      approvalsGiven: nodesDecided.size,
+      approvalsRemaining: instance.completedAt ? 0 : remaining,
+      totalApprovals: nodesDecided.size + (instance.completedAt ? 0 : remaining),
+      steps,
+    };
   }
 
   private findNode(graph: WorkflowGraph, nodeId: string): WorkflowNode {

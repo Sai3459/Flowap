@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Controller, Get, Headers, Injectable, Module } from '@nestjs/common';
+import { ApiHeader, ApiTags } from '@nestjs/swagger';
 import { and, eq } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
-import { vendors } from '../db/schema';
+import { users, vendors } from '../db/schema';
 
 /**
  * Shared vendor resolution. Both invoice ingestion and purchase-order sync need to turn a
@@ -44,5 +45,34 @@ export class VendorsService {
 
   async list(tenantId: string) {
     return this.db.select().from(vendors).where(eq(vendors.tenantId, tenantId));
+  }
+
+  /**
+   * Tenant users. Backs the workspace's role switcher — which stands in for a login until SSO
+   * exists, and disappears the moment it does.
+   */
+  async listUsers(tenantId: string) {
+    return this.db
+      .select({ id: users.id, name: users.name, email: users.email, role: users.role })
+      .from(users)
+      .where(eq(users.tenantId, tenantId))
+      .orderBy(users.role);
+  }
+}
+
+@ApiTags('directory')
+@ApiHeader({ name: 'x-tenant-id', required: true })
+@Controller()
+export class DirectoryController {
+  constructor(private readonly vendorsService: VendorsService) {}
+
+  @Get('vendors')
+  vendors(@Headers('x-tenant-id') tenantId: string) {
+    return this.vendorsService.list(tenantId);
+  }
+
+  @Get('users')
+  users(@Headers('x-tenant-id') tenantId: string) {
+    return this.vendorsService.listUsers(tenantId);
   }
 }

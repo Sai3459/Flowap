@@ -28,6 +28,15 @@ import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { WorkflowEngineService } from '../workflow/workflow-engine.service';
 import { VendorsService } from '../vendors/vendors.service';
 
+/** Metadata for a document uploaded through the UI rather than posted in as a URL. */
+export interface StoredFile {
+  storedFilename: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  url: string;
+}
+
 /**
  * Header fields a human may correct, and how the incoming string maps onto the column's
  * type. Money columns are `numeric` and take strings (never floats — see CLAUDE.md);
@@ -170,7 +179,7 @@ export class InvoicesService {
    * Synchronous/inline for the prototype. In production this becomes an event-driven
    * pipeline (one queue per stage) so a slow extraction call never blocks ingestion.
    */
-  async ingest(tenantId: string, dto: IngestInvoiceDto) {
+  async ingest(tenantId: string, dto: IngestInvoiceDto, file?: StoredFile) {
     const [invoice] = await this.db
       .insert(invoices)
       .values({
@@ -178,6 +187,10 @@ export class InvoicesService {
         sourceChannel: dto.sourceChannel,
         fileUrl: dto.fileUrl,
         status: 'EXTRACTING',
+        storedFilename: file?.storedFilename,
+        originalFilename: file?.originalFilename,
+        fileMimeType: file?.mimeType,
+        fileSizeBytes: file?.sizeBytes,
       })
       .returning();
 
@@ -190,12 +203,11 @@ export class InvoicesService {
       extracted = await this.extraction.extract(dto.fileUrl);
     } catch (err) {
       this.logger.error(`Extraction failed for invoice ${invoice.id}`, err as Error);
-      const [updated] = await this.db
+      await this.db
         .update(invoices)
         .set({ status: 'NEEDS_REVIEW', updatedAt: new Date() })
-        .where(eq(invoices.id, invoice.id))
-        .returning();
-      return updated;
+        .where(eq(invoices.id, invoice.id));
+      return this.findOne(tenantId, invoice.id);
     }
 
     const fieldsNeedingReview = ExtractionClientService.fieldsNeedingReview(extracted);
@@ -226,7 +238,7 @@ export class InvoicesService {
     // different vendor rows for the same company.
     const vendorId = await this.vendorsService.resolveByName(tenantId, extracted.vendorName.value);
 
-    const [updated] = await this.db
+    await this.db
       .update(invoices)
       .set({
         documentType: extracted.documentType.value ?? undefined,
@@ -247,8 +259,7 @@ export class InvoicesService {
         status: nextStatus,
         updatedAt: new Date(),
       })
-      .where(eq(invoices.id, invoice.id))
-      .returning();
+      .where(eq(invoices.id, invoice.id));
 
     if (extracted.lineItems.length > 0) {
       await this.db.insert(invoiceLineItems).values(
@@ -272,10 +283,12 @@ export class InvoicesService {
     });
 
     if (nextStatus === 'VALIDATING') {
-      return this.runValidation(tenantId, invoice.id);
+      await this.runValidation(tenantId, invoice.id);
     }
 
-    return updated;
+    // Always the joined detail shape, same as GET /invoices/:id — a client that just
+    // uploaded a document needs its exceptions and line items, not a bare row.
+    return this.findOne(tenantId, invoice.id);
   }
 
   /**

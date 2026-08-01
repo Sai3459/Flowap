@@ -1,37 +1,39 @@
 import type {
+  ApprovalProgress,
+  CodingQueueItem,
+  CostCenter,
+  DashboardSummary,
   ExceptionQueueItem,
+  GlAccount,
+  InboxItem,
   InvoiceDetail,
   InvoiceListItem,
+  ApprovalHistoryItem,
+  PurchaseOrder,
+  ReadyToPostItem,
+  TenantUser,
 } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000';
 
 /**
- * Tenant is sent as a raw `x-tenant-id` header because that is what the backend currently
- * accepts — a documented prototype shortcut, not a real auth boundary (see CLAUDE.md).
- * It is kept in localStorage so it survives reloads and can be switched without a rebuild;
- * when SSO lands, this whole module stops sending the header and the tenant comes from the
- * session instead.
+ * Tenant and current user are both client-held, because the backend still resolves the tenant
+ * from an `x-tenant-id` header and has no login at all. The user picker is a stand-in for
+ * authentication so approvals can be exercised as different people — it disappears entirely
+ * when SSO lands, and nothing else in the UI depends on it existing.
  */
-const TENANT_STORAGE_KEY = 'flowap.tenantId';
+const TENANT_KEY = 'flowap.tenantId';
+const USER_KEY = 'flowap.userId';
 
-export function getTenantId(): string {
-  return (
-    localStorage.getItem(TENANT_STORAGE_KEY) ??
-    (import.meta.env.VITE_TENANT_ID as string | undefined) ??
-    ''
-  );
-}
-
-export function setTenantId(tenantId: string): void {
-  localStorage.setItem(TENANT_STORAGE_KEY, tenantId.trim());
-}
+export const session = {
+  tenantId: () => localStorage.getItem(TENANT_KEY) ?? (import.meta.env.VITE_TENANT_ID as string | undefined) ?? '',
+  setTenantId: (id: string) => localStorage.setItem(TENANT_KEY, id.trim()),
+  userId: () => localStorage.getItem(USER_KEY) ?? '',
+  setUserId: (id: string) => localStorage.setItem(USER_KEY, id),
+};
 
 export class ApiError extends Error {
-  // Declared explicitly rather than as a constructor parameter property: the tsconfig
-  // enables erasableSyntaxOnly, which disallows that syntax.
   readonly status: number;
-
   constructor(message: string, status: number) {
     super(message);
     this.name = 'ApiError';
@@ -39,61 +41,112 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const tenantId = getTenantId();
-  if (!tenantId) {
-    throw new ApiError('No tenant selected — set one in the header bar.', 0);
-  }
+async function request<T>(path: string, init?: RequestInit, rawBody = false): Promise<T> {
+  const tenantId = session.tenantId();
+  if (!tenantId) throw new ApiError('No tenant selected.', 0);
+
+  const headers: Record<string, string> = { 'x-tenant-id': tenantId, ...(init?.headers as Record<string, string>) };
+  if (!rawBody) headers['Content-Type'] = 'application/json';
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
-      ...init,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-tenant-id': tenantId,
-        ...init?.headers,
-      },
-    });
+    response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
   } catch {
-    // fetch only rejects on network-level failure, which here almost always means the
-    // API isn't running — worth saying so rather than surfacing "Failed to fetch".
     throw new ApiError(`Cannot reach the API at ${API_BASE_URL}. Is the backend running?`, 0);
   }
-
-  if (!response.ok) {
-    throw new ApiError(await readErrorMessage(response), response.status);
-  }
+  if (!response.ok) throw new ApiError(await readError(response), response.status);
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
-/** Nest error bodies look like `{ message, error, statusCode }`; message may be an array. */
-async function readErrorMessage(response: Response): Promise<string> {
+/** Nest error bodies are `{ message, error, statusCode }`; message may be an array. */
+async function readError(response: Response): Promise<string> {
   try {
     const body = await response.json();
-    const message = (body as { message?: unknown }).message;
-    if (Array.isArray(message)) return message.join('; ');
-    if (typeof message === 'string') return message;
+    const m = (body as { message?: unknown }).message;
+    if (Array.isArray(m)) return m.join('; ');
+    if (typeof m === 'string') return m;
   } catch {
-    // fall through to the status text
+    /* fall through */
   }
   return `${response.status} ${response.statusText}`;
 }
 
 export const api = {
+  // --- directory / session ---
+  listUsers: () => request<TenantUser[]>('/users'),
+
+  // --- overview ---
+  dashboard: () => request<DashboardSummary>('/dashboard'),
+
+  // --- invoices ---
   listInvoices: () => request<InvoiceListItem[]>('/invoices'),
-
   getInvoice: (id: string) => request<InvoiceDetail>(`/invoices/${id}`),
-
   listExceptions: () => request<ExceptionQueueItem[]>('/invoices/exceptions'),
-
-  /**
-   * Values go over the wire as strings — the backend parses and validates per field
-   * (money stays a string end to end to keep currency out of floating point).
-   */
   correctField: (invoiceId: string, fieldName: string, correctedValue: string) =>
     request<InvoiceDetail>(`/invoices/${invoiceId}/correct-field`, {
       method: 'PATCH',
       body: JSON.stringify({ fieldName, correctedValue }),
+    }),
+  revalidate: (invoiceId: string) =>
+    request<{ revalidated: boolean; reason: string; invoice: InvoiceDetail }>(
+      `/invoices/${invoiceId}/revalidate`,
+      { method: 'POST' },
+    ),
+
+  /** Multipart — no JSON content-type, the browser sets the boundary. */
+  upload: (file: File, sourceChannel = 'MANUAL_UPLOAD') => {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('sourceChannel', sourceChannel);
+    return request<InvoiceDetail>('/invoices/upload', { method: 'POST', body: form }, true);
+  },
+
+  // --- approvals ---
+  inbox: (approverId: string) => request<InboxItem[]>(`/approvals/inbox/${approverId}`),
+  approvalHistory: (approverId: string) => request<ApprovalHistoryItem[]>(`/approvals/history/${approverId}`),
+  approvalProgress: (invoiceId: string) => request<ApprovalProgress | null>(`/approvals/${invoiceId}/progress`),
+  decide: (stepId: string, decision: 'APPROVE' | 'REJECT', approverId: string, comment?: string) =>
+    request<unknown>(`/approvals/steps/${stepId}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, approverId, comment }),
+    }),
+  delegate: (stepId: string, fromApproverId: string, toApproverId: string, comment?: string) =>
+    request<unknown>(`/approvals/steps/${stepId}/delegate`, {
+      method: 'POST',
+      body: JSON.stringify({ fromApproverId, toApproverId, comment }),
+    }),
+
+  // --- cost assignment ---
+  glAccounts: () => request<GlAccount[]>('/gl-accounts'),
+  costCenters: () => request<CostCenter[]>('/cost-centers'),
+  codingQueue: () => request<CodingQueueItem[]>('/cost-assignment/queue'),
+  codingSuggestions: (invoiceId: string) =>
+    request<{ glAccountId: string; costCenterId: string; label: string; reason: string }[]>(
+      `/invoices/${invoiceId}/coding-suggestions`,
+    ),
+  codeLine: (invoiceId: string, lineId: string, glAccountId?: string, costCenterId?: string) =>
+    request<{ codingStatus: { totalLines: number; codedLines: number; isComplete: boolean } }>(
+      `/invoices/${invoiceId}/lines/${lineId}/code`,
+      { method: 'PATCH', body: JSON.stringify({ glAccountId, costCenterId }) },
+    ),
+
+  // --- posting ---
+  readyToPost: () => request<ReadyToPostItem[]>('/posting/ready'),
+  postedInvoices: () => request<InvoiceListItem[]>('/posting/posted'),
+  postInvoice: (invoiceId: string, postedById?: string) =>
+    request<InvoiceDetail>(`/invoices/${invoiceId}/post`, {
+      method: 'POST',
+      body: JSON.stringify({ postedById }),
+    }),
+
+  // --- purchase orders ---
+  purchaseOrders: () => request<PurchaseOrder[]>('/purchase-orders'),
+  createPurchaseOrder: (body: unknown) =>
+    request<PurchaseOrder>('/purchase-orders', { method: 'POST', body: JSON.stringify(body) }),
+  recordReceipt: (poNumber: string, receivedQty: Record<string, number>) =>
+    request<PurchaseOrder>(`/purchase-orders/${poNumber}/receipts`, {
+      method: 'POST',
+      body: JSON.stringify({ receivedQty }),
     }),
 };

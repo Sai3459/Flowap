@@ -107,7 +107,13 @@ export const invoices = pgTable('invoices', {
 
   status: invoiceStatusEnum('status').notNull().default('RECEIVED'),
   sourceChannel: text('source_channel').notNull(),
+  /** Where the document lives. For uploads this points back at this API's own /files route,
+   *  which is what lets the extraction service fetch it the same way it would any URL. */
   fileUrl: text('file_url').notNull(),
+  storedFilename: text('stored_filename'), // set for uploads; null when a URL was posted in
+  originalFilename: text('original_filename'),
+  fileMimeType: text('file_mime_type'),
+  fileSizeBytes: integer('file_size_bytes'),
 
   documentType: text('document_type'), // INVOICE | CREDIT_NOTE | RECEIPT | UNKNOWN, as extracted
 
@@ -132,6 +138,14 @@ export const invoices = pgTable('invoices', {
 
   // { "invoiceNumber": { "confidence": 0.97, "source": "AI_EXTRACTED" }, ... }
   fieldConfidence: jsonb('field_confidence'),
+
+  // --- Posting back to the ERP ---
+  // The ERP's own document number, returned by the posting call. This tool never becomes the
+  // ledger (design decision 5) — it records what the ERP assigned so the two can be
+  // reconciled. Simulated for now; a real connector fills the same columns.
+  erpDocumentNumber: text('erp_document_number'),
+  postedAt: timestamp('posted_at'),
+  postedById: uuid('posted_by_id'),
 
   // --- PO match results ---
   // Flat numerics rather than only jsonb, because workflow CONDITION nodes evaluate a
@@ -161,11 +175,47 @@ export const invoiceLineItems = pgTable('invoice_line_items', {
   taxRate: real('tax_rate'), // percentage, e.g. 19.0
   glCode: text('gl_code'),
   glCodeSource: fieldSourceEnum('gl_code_source'),
+  /** Cost assignment. A line is "coded" once both are set; an invoice is codeable-complete
+   *  when every line is. Kept as FKs (not just the free-text glCode) so coding can be
+   *  validated against the synced chart of accounts. */
+  glAccountId: uuid('gl_account_id').references(() => glAccounts.id),
+  costCenterId: uuid('cost_center_id').references(() => costCenters.id),
   confidence: real('confidence'),
   /** Which PO line this was matched to, once PO matching has run. Null = unmatched. */
   poLineNumber: integer('po_line_number'),
 }, (t) => ({
   invoiceIdx: index('line_items_invoice_idx').on(t.invoiceId),
+}));
+
+/**
+ * Chart of accounts, synced from the ERP. Like purchase orders, this is a local copy for
+ * coding and validation — the ERP remains the master.
+ */
+export const glAccounts = pgTable('gl_accounts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  code: text('code').notNull(),
+  name: text('name').notNull(),
+  /** EXPENSE | ASSET | LIABILITY | REVENUE — drives which accounts are offered for AP coding. */
+  accountType: text('account_type').notNull().default('EXPENSE'),
+  isActive: boolean('is_active').notNull().default(true),
+}, (t) => ({
+  tenantCodeUnique: unique().on(t.tenantId, t.code),
+  tenantIdx: index('gl_accounts_tenant_idx').on(t.tenantId),
+}));
+
+/** Cost centres / internal orders an expense can be charged to. */
+export const costCenters = pgTable('cost_centers', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  code: text('code').notNull(),
+  name: text('name').notNull(),
+  /** The person accountable for this cost centre — the natural approver for non-PO spend. */
+  ownerId: uuid('owner_id').references(() => users.id),
+  isActive: boolean('is_active').notNull().default(true),
+}, (t) => ({
+  tenantCodeUnique: unique().on(t.tenantId, t.code),
+  tenantIdx: index('cost_centers_tenant_idx').on(t.tenantId),
 }));
 
 export const invoiceExceptions = pgTable('invoice_exceptions', {

@@ -37,6 +37,24 @@ export class ApprovalsController {
     return this.workflowEngine.findOverdueSteps(tenantId);
   }
 
+  /** One approver's work queue — what is waiting on them right now. */
+  @Get('inbox/:approverId')
+  inbox(@Headers('x-tenant-id') tenantId: string, @Param('approverId') approverId: string) {
+    return this.workflowEngine.findPendingForApprover(tenantId, approverId);
+  }
+
+  /** One approver's decision history — what they have already approved, rejected or delegated. */
+  @Get('history/:approverId')
+  history(@Headers('x-tenant-id') tenantId: string, @Param('approverId') approverId: string) {
+    return this.workflowEngine.findHistoryForApprover(tenantId, approverId);
+  }
+
+  /** How many approvals an invoice has had and how many it still needs. */
+  @Get(':invoiceId/progress')
+  progress(@Headers('x-tenant-id') tenantId: string, @Param('invoiceId') invoiceId: string) {
+    return this.workflowEngine.getApprovalProgress(tenantId, invoiceId);
+  }
+
   @Post('escalate-overdue')
   escalateOverdue(@Headers('x-tenant-id') tenantId: string) {
     return this.workflowEngine.escalateOverdueSteps(tenantId);

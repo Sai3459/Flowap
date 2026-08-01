@@ -1,32 +1,16 @@
-/** Mirrors the backend's invoice_status enum (see backend/src/db/schema.ts). */
+/** Mirrors the backend's invoice_status enum (backend/src/db/schema.ts). */
 export type InvoiceStatus =
-  | 'RECEIVED'
-  | 'CLASSIFYING'
-  | 'EXTRACTING'
-  | 'NEEDS_REVIEW'
-  | 'VALIDATING'
-  | 'MATCHING'
-  | 'EXCEPTION'
-  | 'PENDING_APPROVAL'
-  | 'APPROVED'
-  | 'POSTED'
-  | 'PAID'
-  | 'REJECTED';
+  | 'RECEIVED' | 'CLASSIFYING' | 'EXTRACTING' | 'NEEDS_REVIEW' | 'VALIDATING'
+  | 'MATCHING' | 'EXCEPTION' | 'PENDING_APPROVAL' | 'APPROVED' | 'POSTED' | 'PAID' | 'REJECTED';
 
 export type FieldSource = 'AI_EXTRACTED' | 'HUMAN_CORRECTED' | 'MANUAL_ENTRY';
+export type StepStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'SKIPPED' | 'DELEGATED';
 
-/**
- * Per-field confidence + provenance, the core of the review UX: a field at 0.98 is left
- * alone while a field at 0.4 gets flagged, even on the same document.
- */
-export interface FieldConfidence {
-  confidence: number;
-  source: FieldSource;
-}
-
+export interface FieldConfidence { confidence: number; source: FieldSource }
 export type FieldConfidenceMap = Record<string, FieldConfidence | undefined>;
 
-/** Row shape from GET /invoices — the list view's projection, not the full invoice. */
+export interface TenantUser { id: string; name: string; email: string; role: string }
+
 export interface InvoiceListItem {
   id: string;
   status: InvoiceStatus;
@@ -39,17 +23,39 @@ export interface InvoiceListItem {
   createdAt: string;
   vendorName: string | null;
   lowConfidenceFields: string[];
-  /** Worst overbill across lines, from PO matching. Null when there was no PO to match. */
   priceVariancePct: number | null;
   quantityVariancePct: number | null;
+  erpDocumentNumber?: string | null;
 }
 
-export type LineMatchStatus =
-  | 'MATCHED'
-  | 'PRICE_VARIANCE'
-  | 'QUANTITY_VARIANCE'
-  | 'OVER_RECEIPT'
-  | 'UNMATCHED';
+export interface LineItem {
+  id: string;
+  invoiceId: string;
+  description: string;
+  quantity: string;
+  unitPrice: string;
+  lineTotal: string;
+  taxCode: string | null;
+  taxRate: number | null;
+  glCode: string | null;
+  glAccountId: string | null;
+  costCenterId: string | null;
+  glCodeSource: FieldSource | null;
+  confidence: number | null;
+  poLineNumber: number | null;
+}
+
+export interface InvoiceException {
+  id: string;
+  invoiceId: string;
+  type: string;
+  detail: string;
+  suggestedFix: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+}
+
+export type LineMatchStatus = 'MATCHED' | 'PRICE_VARIANCE' | 'QUANTITY_VARIANCE' | 'OVER_RECEIPT' | 'UNMATCHED';
 
 export interface LineMatch {
   invoiceLineId: string;
@@ -64,7 +70,6 @@ export interface LineMatch {
   explanation: string | null;
 }
 
-/** `invoices.matchResult` — the detail behind the flat variance columns. */
 export interface PoMatchResult {
   maxPriceVariancePct: number | null;
   maxQuantityVariancePct: number | null;
@@ -74,33 +79,6 @@ export interface PoMatchResult {
   headerIssues: string[];
 }
 
-export interface LineItem {
-  id: string;
-  invoiceId: string;
-  description: string;
-  quantity: string;
-  unitPrice: string;
-  lineTotal: string;
-  taxCode: string | null;
-  taxRate: number | null;
-  glCode: string | null;
-  glCodeSource: FieldSource | null;
-  confidence: number | null;
-  /** PO line this was matched to, once matching has run. */
-  poLineNumber: number | null;
-}
-
-export interface InvoiceException {
-  id: string;
-  invoiceId: string;
-  type: string;
-  detail: string;
-  suggestedFix: string | null;
-  resolvedAt: string | null;
-  createdAt: string;
-}
-
-/** GET /invoices/:id — full invoice with line items and exceptions. */
 export interface InvoiceDetail {
   id: string;
   tenantId: string;
@@ -109,9 +87,11 @@ export interface InvoiceDetail {
   status: InvoiceStatus;
   sourceChannel: string;
   fileUrl: string;
+  originalFilename: string | null;
+  fileMimeType: string | null;
+  fileSizeBytes: number | null;
   documentType: string | null;
   invoiceNumber: string | null;
-  /** As printed on the document; may not resolve to a real PO (see MISSING_PO). */
   poNumber: string | null;
   referenceNumber: string | null;
   invoiceDate: string | null;
@@ -122,21 +102,124 @@ export interface InvoiceDetail {
   taxAmount: string | null;
   totalAmount: string | null;
   vendorTaxId: string | null;
+  fieldConfidence: FieldConfidenceMap | null;
   priceVariancePct: number | null;
   quantityVariancePct: number | null;
   totalVarianceAmount: string | null;
   matchResult: PoMatchResult | null;
-  fieldConfidence: FieldConfidenceMap | null;
+  erpDocumentNumber: string | null;
+  postedAt: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Joined from the vendor relation — it has a confidence score, so the UI needs the value. */
   vendorName: string | null;
   lineItems: LineItem[];
   exceptions: InvoiceException[];
 }
 
-/** GET /invoices/exceptions — queue rows carry their line items and exceptions inline. */
 export interface ExceptionQueueItem extends Omit<InvoiceDetail, 'lineItems' | 'exceptions'> {
   lineItems: LineItem[];
   exceptions: InvoiceException[];
+}
+
+// ---- approvals ----
+
+export interface ApprovalStep {
+  id: string;
+  instanceId: string;
+  nodeId: string;
+  approverId: string | null;
+  status: StepStatus;
+  comment: string | null;
+  slaDueAt: string | null;
+  slaBreachedAt: string | null;
+  actedAt: string | null;
+}
+
+export interface InboxItem {
+  step: ApprovalStep;
+  invoiceId: string;
+  invoiceNumber: string | null;
+  totalAmount: string | null;
+  currency: string | null;
+  poNumber: string | null;
+  priceVariancePct: number | null;
+  quantityVariancePct: number | null;
+  vendorName: string | null;
+}
+
+export interface ApprovalHistoryItem {
+  step: ApprovalStep;
+  invoiceId: string;
+  invoiceNumber: string | null;
+  totalAmount: string | null;
+  currency: string | null;
+  invoiceStatus: InvoiceStatus;
+  vendorName: string | null;
+}
+
+export interface ApprovalProgress {
+  workflowName: string;
+  currentNodeId: string | null;
+  completedAt: string | null;
+  approvalsGiven: number;
+  approvalsRemaining: number;
+  totalApprovals: number;
+  steps: ApprovalStep[];
+}
+
+// ---- cost assignment ----
+
+export interface GlAccount { id: string; code: string; name: string; accountType: string }
+export interface CostCenter { id: string; code: string; name: string; ownerId: string | null }
+
+export interface CodingQueueItem {
+  id: string;
+  invoiceNumber: string | null;
+  status: InvoiceStatus;
+  totalAmount: string | null;
+  currency: string | null;
+  poNumber: string | null;
+  createdAt: string;
+  coding: { totalLines: number; codedLines: number; isComplete: boolean };
+}
+
+// ---- posting / PO ----
+
+export interface ReadyToPostItem extends InvoiceListItem { uncodedLines: number }
+
+export interface PoLineItem {
+  lineNumber: number;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+  unit?: string;
+}
+
+export interface PurchaseOrder {
+  id: string;
+  poNumber: string;
+  vendorId: string;
+  currency: string;
+  totalAmount: string;
+  lineItems: PoLineItem[];
+  receivedQty: Record<string, number> | null;
+}
+
+// ---- dashboard ----
+
+export interface DashboardSummary {
+  totals: { invoices: number; touchlessRate: number | null; purchaseOrders: number; vendors: number };
+  byStatus: { status: InvoiceStatus; count: number; value: string }[];
+  openExceptions: { type: string; count: number }[];
+  overdueApprovals: number;
+  awaitingApproval: { count: number; value: string };
+  posted: { count: number; value: string };
+  recentActivity: {
+    action: string;
+    createdAt: string;
+    invoiceId: string | null;
+    invoiceNumber: string | null;
+    detail: unknown;
+  }[];
 }

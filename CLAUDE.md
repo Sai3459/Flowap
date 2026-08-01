@@ -252,45 +252,64 @@ node — there's a regression test for exactly that.
   `fieldName` straight into an `UPDATE ... SET`, so a client could rewrite `status`,
   `tenantId` or `vendorId` through it; correcting a date also threw, because Drizzle needs a
   `Date` for a timestamp column and the endpoint passed the raw string.
-- **Frontend** (`frontend/`, React + TS + Vite) — three screens, verified in a real browser
-  against the running API:
-  - **Invoice list** — status, vendor, amount, and a per-row confidence indicator
-    (`N fields flagged` / `clean`).
-  - **Invoice detail** — every extracted field beside its confidence and provenance; only
-    sub-threshold rows are highlighted, which is the per-field design made visible. Flagged
-    fields are editable inline against the correct-field endpoint, and server-side validation
-    errors render in the row. A correction flips the row to `corrected` at 100% and drops it
-    out of the flagged count.
-  - **Review queue** — `NEEDS_REVIEW` + `EXCEPTION`, showing each recorded exception's detail
-    and suggested fix, plus a generated summary of which fields were low-confidence and why.
+- **Upload / inbound** — `POST /invoices/upload` (multipart) stores the document to disk and
+  hands it to the pipeline **by URL**, served back from `GET /files/:name`. An upload and a
+  connector push therefore take an identical path with no second code path. This is what makes
+  the vision route reachable without a developer; extraction itself is still the mock.
+- **Simulated ERP posting** — `POST /invoices/:id/post` moves an APPROVED, fully-coded invoice
+  to `POSTED` and stores a generated `erpDocumentNumber`. No ERP is contacted: a real connector
+  replaces one method (`generateDocumentNumber`) and fills the same columns. Posting is
+  terminal, and coding is frozen afterwards, because the ERP then holds the accounting document.
+- **Cost assignment (GL coding)** — `glAccounts` and `costCenters` synced by code, per-line
+  `glAccountId`/`costCenterId`, `PATCH /invoices/:id/lines/:lineId/code`, a coding queue, and
+  suggestions derived from how this tenant coded the same vendor before (evidence-based, so the
+  UI can show *why*). An invoice cannot post until every line is coded.
+- **Approval visibility** — `GET /approvals/inbox/:approverId` (what is waiting on one person),
+  `GET /approvals/history/:approverId` (their past decisions), and
+  `GET /approvals/:invoiceId/progress`, which walks the graph forward to answer "how many more
+  approvals does this need".
+- **Dashboard** — `GET /dashboard`: counts and value by status, open exceptions by type, overdue
+  approvals, touchless rate, and recent audit activity in one aggregate read.
+- **Frontend** (`frontend/`, React + TS + Vite) — a single role-switched workspace in a dark
+  telemetry design system (mono for all data, four semantic colours, per-field confidence shown
+  as a ten-segment equalizer). Verified in a real browser: upload → code → approve → post ran
+  end to end and produced ERP document 5106040049.
+  - **Overview** — pipeline by status, open exceptions, overdue approvals, touchless rate, audit feed.
+  - **Upload** — drag-and-drop inbound, showing each document's outcome immediately.
+  - **Invoices** — filterable list with confidence and PO-match indicators and the ERP doc number.
+  - **Invoice detail** — approval chain and progress meter, per-field confidence with inline
+    correction, PO match table, line items with coding state.
+  - **Review queue** — exceptions and low-confidence extractions with their suggested fixes.
+  - **Cost assignment** — per-line GL/cost-centre coding with history-based suggestions.
+  - **My approvals** — inbox with approve / reject / delegate, plus personal decision history.
+  - **Posting** — ready-to-post list gated on coding, and everything already posted.
+  - **Purchase orders** — orders, lines, goods-receipt entry, and a PO sync form.
 
 ## Not yet built (in rough priority order)
-1. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack. This is
-   also what makes the workflow engine's approver check real: `decideStep`/`delegateStep`
-   verify the caller is the step's assigned approver, but they compare against a
-   **client-supplied** `approverId` in the request body. That stops wrong-user and
-   accidental decisions; it is not authorization until the id comes from a session. When
-   this lands, `assertIsAssignedApprover` should read the session subject instead — the
-   check itself doesn't need to move.
-2. **Posting after approval** — an approved invoice currently just sits at `APPROVED` and
-   stops. `POSTED`/`PAID` exist in the status enum with nothing setting them, and
-   `erpConnections` stores connector config with no connector logic behind it. This is the
-   biggest remaining functional hole: the tool cannot yet hand anything back to the ERP.
-   Target shape is push-to-ERP storing the returned ERP document number — the ERP stays the
-   system of record (design decision 5), so this tool must not become the ledger.
-3. **Approvals in the UI** — the three review screens exist, but nothing in the frontend
-   touches the workflow engine. No approve/reject/delegate view, no overdue dashboard, no
-   mobile approval screen. `GET /approvals/:invoiceId` and the decide/delegate endpoints are
-   API-only, and the detail screen doesn't show where an invoice sits in its approval graph.
-4. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
-5. **AI copilot** — natural-language invoice search, GL coding suggestions, plain-language
-   explanations of why an invoice is stuck (the extraction service's `_consistency_warnings`
-   are a natural input to this).
-6. **Feedback loop** — `/feedback` endpoint on the extraction service is a stub; needs to
-   actually persist corrections per tenant/vendor-layout and feed them back into the
-   extraction prompt as few-shot examples.
-7. **Vendor portal** — separate, simplified auth context and shell.
-8. **ERP connectors** — `ErpConnection` config storage exists; no actual connector logic.
+1. **One real extraction run.** The vision path in `extraction-service/main.py` fetches the
+   document and calls Claude, and uploads now feed it a genuine URL — but no real PDF and no
+   real `ANTHROPIC_API_KEY` has ever gone through it. Every result in this repo, including the
+   screenshots, came from `mock_server.py`. Until this runs once, the extraction claims are
+   unverified.
+2. **Real auth** — SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
+   workspace's "acting as" picker. This is also what makes the approver check real:
+   `decideStep`/`delegateStep` verify the caller is the step's assigned approver, but against a
+   **client-supplied** `approverId`. That stops wrong-user and accidental decisions; it is not
+   authorization until the id comes from a session. `assertIsAssignedApprover` then reads the
+   session subject — the check itself doesn't move. Same for `postedById`.
+3. **A real ERP connector.** Posting is simulated: the document number is generated locally.
+   `erpConnections` still stores config with no connector logic. Nothing pulls purchase orders,
+   GL accounts, cost centres or vendors from an ERP either — all four are pushed in by hand.
+4. **Notifying the next approver.** Approval is pull-only: a step is created and the approver
+   has to look in their inbox. No email, no push, no digest. For a tool whose whole pitch is
+   removing friction, this is the most conspicuous missing piece after auth.
+5. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
+6. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
+   frequency counts over this vendor's history, not a model call), plain-language explanations
+   of why an invoice is stuck (`_consistency_warnings` is a natural input).
+7. **Feedback loop** — `/feedback` on the extraction service is a stub; corrections should
+   persist per tenant/vendor-layout and feed back into the prompt as few-shot examples.
+8. **Vendor portal** — separate, simplified auth context and shell.
 
 ### Known gaps in the workflow engine
 - **The SLA scheduler is a single-process in-memory cron, with no locking.** Fine for one
@@ -356,15 +375,31 @@ node — there's a regression test for exactly that.
   variance invoice deliberately sits at `PENDING_APPROVAL`, so an open `PO_MISMATCH` is only
   visible on the detail screen. An "open exceptions" view independent of status is missing.
 
+### Known gaps in upload, coding and posting
+- **Uploaded files are served unauthenticated.** `GET /files/:name` takes no tenant header,
+  because the extraction service fetches it as an anonymous client. Names are unguessable
+  UUIDs, which is adequate for a prototype and **not** adequate for production — invoice PDFs
+  are confidential and want signed, expiring URLs.
+- **Files are stored on local disk** (`backend/uploads/`), so the API is no longer stateless and
+  a second replica would not see the first's uploads. Swap `FileStorageService` for S3/blob.
+- **Posting does not contact anything.** The `erpDocumentNumber` is generated locally and looks
+  real; the UI says so on screen, but nothing enforces that a reader knows it is simulated.
+- **No credit notes or reversals.** Posting is terminal by design, so the only correct response
+  to a posted-in-error invoice is an ERP-side reversal — which this tool cannot request.
+- **Coding has no rules or defaults.** Suggestions are frequency counts over the same vendor's
+  previous lines; there is no rule engine, no per-category default, no split coding (one line to
+  several cost centres), and no budget or authorisation check against the cost centre owner.
+- **`costCenters.ownerId` is captured but unused.** It is the natural approver for non-PO spend,
+  which is exactly the dynamic approver type the workflow engine still lacks.
+
 ### Known gaps in the frontend
 - **No tests at all.** Verified by driving a real browser against the running API, not by
-  anything repeatable. No component tests, no e2e suite.
-- **Tenant is typed into the header bar** and kept in localStorage, mirroring the backend's
-  `x-tenant-id` hack. It is a prototype affordance and should be deleted wholesale when SSO
-  lands, not adapted.
-- **Read-mostly.** The only write in the whole UI is correct-field. No ingestion/upload
-  screen (invoices arrive via `POST /invoices` by hand), no approval actions, no way to
-  resolve an exception — `invoiceExceptions.resolvedAt` has no endpoint or UI behind it.
+  anything repeatable. No component tests, no e2e suite. This is now the largest untested
+  surface in the repo: ~2,600 lines of UI against 97 backend unit tests.
+- **Identity is picked, not authenticated.** Both the tenant field and the "acting as" role
+  switcher are prototype affordances to be deleted when SSO lands, not adapted.
+- **No way to resolve an exception from the UI.** `invoiceExceptions.resolvedAt` is only ever
+  set automatically by re-validation; a human cannot dismiss one.
 - **Duplicated constants.** `CONFIDENCE_REVIEW_THRESHOLD`, the correctable-field list and
   the field labels are restated in `frontend/src/lib/confidence.ts`. The backend stays
   authoritative (it returns `lowConfidenceFields` and rejects non-allowlisted fields), but

@@ -1,12 +1,15 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { and, eq, inArray, ne } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import {
   invoices,
   invoiceLineItems,
   invoiceExceptions,
   auditEvents,
+  invoiceStatusEnum,
 } from '../db/schema';
+
+type InvoiceStatus = (typeof invoiceStatusEnum.enumValues)[number];
 import {
   ExtractionClientService,
   ExtractionResult,
@@ -187,6 +190,27 @@ export class InvoicesService {
     // endpoint so the per-tenant example set improves for next time.
 
     return updated;
+  }
+
+  /**
+   * Tenant-scoped invoice list, newest first. `statuses` is optional; an empty array
+   * means "no status filter". Deliberately does not fan out to line items or
+   * exceptions — the list screen only needs header fields, and findOne() is there
+   * for the detail view.
+   */
+  async findAll(tenantId: string, statuses: InvoiceStatus[] = []) {
+    const scope = [eq(invoices.tenantId, tenantId)];
+    if (statuses.length > 0) {
+      scope.push(inArray(invoices.status, statuses));
+    }
+
+    return this.db
+      .select()
+      .from(invoices)
+      .where(and(...scope))
+      // id breaks ties: invoices ingested in the same batch share a createdAt, and
+      // without a tiebreaker their relative order is whatever Postgres feels like.
+      .orderBy(desc(invoices.createdAt), desc(invoices.id));
   }
 
   async findExceptionQueue(tenantId: string) {

@@ -132,6 +132,36 @@ def scenarios() -> dict:
             subtotal=450.00, tax=36.00, total=486.00,
             lines=[line("Paper reams", 30, 15, 450.00)],
         ),
+        # REAL DOCUMENT — Arena Media Comunicaciones España, S.A. billing PUMA ITALIA SRL.
+        # Transcribed by hand from the supplied PDF; NOT produced by the extraction service,
+        # which has still never run against a real document. Amounts print as 10.000,00 and
+        # dates as 04/05/2026 (day-first); VAT is genuinely 0 (intra-EU reverse charge), and
+        # BUDGET/REQUEST/Order numbers on the page are PO decoys.
+        "arenamedia": invoice(
+            number="2026001293", vendor="Arena Media Comunicaciones España, S.A.",
+            po=None, reference="17294",
+            invoice_date="2026-05-04", due_date="2026-06-03", supply_date=None,
+            vendor_tax_id="A80537327", currency="EUR",
+            bank={"iban": "ES4300491804142810288845", "accountNumber": None,
+                  "bic": "BSCHESMM", "bankName": "Banco Santander"},
+            subtotal=10000.00, tax=0.00, total=10000.00,
+            lines=[line("RETAINER FEE 2026", 1, 10000, 10000.00, tax_code=None, tax_rate=0)],
+        ),
+        # REAL DOCUMENT — Ready4people Development, S.L. billing PUMA ITALIA SRL. Same
+        # provenance caveat. Its tax block prints Spain's 21/10/4 rates as a template with the
+        # I.V.A. column empty: the charged rate is 0, and reading 21% off the template would
+        # invent tax that is not there.
+        "ready4people": invoice(
+            number="260011", vendor="Ready4people Development, S.L.",
+            po=None, reference=None,
+            invoice_date="2026-01-23", due_date="2026-02-22", supply_date=None,
+            vendor_tax_id="B67172452", currency="EUR",
+            bank={"iban": "ES8501820231250204016939", "accountNumber": None,
+                  "bic": "BBVAESMMXXX", "bankName": "Banco Bilbao Vizcaya Argentaria SA"},
+            subtotal=800.00, tax=0.00, total=800.00,
+            lines=[line("Sesiones de Coaching Ejecutivo (Diciembre y Enero)", 2, 400, 800.00,
+                        tax_code=None, tax_rate=0)],
+        ),
         # Retained from before: total contradicts subtotal+tax, so the arithmetic pass
         # downgrades the amount confidences regardless of what the model claimed.
         "inconsistent": invoice(

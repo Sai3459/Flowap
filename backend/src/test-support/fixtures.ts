@@ -159,7 +159,67 @@ export const SCENARIOS = {
     subtotal: 500.0, tax: 40.0, total: 900.0, amountConfidence: 0.95,
     lines: [{ description: 'Widget A', quantity: 10, unitPrice: 50, lineTotal: 500.0, confidence: 0.95 }],
   }),
+  /**
+   * REAL DOCUMENT — Arena Media Comunicaciones España, S.A. (Havas Media Network) billing
+   * PUMA ITALIA SRL. Invoice 2026001293, dated 04/05/2026, due 03/06/2026.
+   *
+   * Provenance, stated plainly: these values were transcribed by hand from the supplied PDF.
+   * They did **not** come out of the extraction service — no `ANTHROPIC_API_KEY` has ever been
+   * available here, so the vision path remains unrun. What this fixture proves is that the
+   * *pipeline* handles a real document's shape; it proves nothing about extraction accuracy.
+   *
+   * What makes it worth keeping:
+   *   - Amounts printed `10.000,00` — European grouping. The old money parser rejected this.
+   *   - Dates `04/05/2026` day-first. The old date parser silently read 5 April.
+   *   - 0% VAT: a Spanish supplier billing an Italian customer is an intra-EU reverse charge,
+   *     so tax is genuinely zero rather than missing.
+   *   - No purchase order. "BUDGET: 536478", "REQUEST Nº: 11/26" and the line's "Order
+   *     23080608" are all decoys an extractor may be tempted to report as a PO.
+   */
+  arenamedia: invoice({
+    number: '2026001293', vendor: 'Arena Media Comunicaciones España, S.A.',
+    po: null, reference: '17294',
+    invoiceDate: '2026-05-04', dueDate: '2026-06-03', supplyDate: null,
+    vendorTaxId: 'A80537327', currency: 'EUR',
+    bank: {
+      iban: 'ES4300491804142810288845', accountNumber: null,
+      bic: 'BSCHESMM', bankName: 'Banco Santander',
+    },
+    subtotal: 10000.0, tax: 0.0, total: 10000.0,
+    lines: [{ description: 'RETAINER FEE 2026', quantity: 1, unitPrice: 10000, lineTotal: 10000, taxCode: null, taxRate: 0 }],
+  }),
+
+  /**
+   * REAL DOCUMENT — Ready4people Development, S.L. (Barcelona) billing PUMA ITALIA SRL.
+   * Factura 260011, 23/01/2026, due 22/02/2026. Same provenance caveat as above.
+   *
+   * Its own hazards:
+   *   - `23/01/2026` has no valid month 23, so the old date parser threw a 400 outright.
+   *   - The tax block prints Spain's three VAT rates (21,00 / 10,00 / 4,00) as a fixed
+   *     template with the I.V.A. column left **empty**. The charged rate is 0 — another
+   *     reverse charge. An extractor reading 21% off the template would invent €168 of tax
+   *     that does not exist, and the arithmetic check would then fail a correct invoice.
+   *   - "Referencia/Pedido Cliente" is literally the customer-PO field, and it is blank.
+   */
+  ready4people: invoice({
+    number: '260011', vendor: 'Ready4people Development, S.L.',
+    po: null, reference: null,
+    invoiceDate: '2026-01-23', dueDate: '2026-02-22', supplyDate: null,
+    vendorTaxId: 'B67172452', currency: 'EUR',
+    bank: {
+      iban: 'ES8501820231250204016939', accountNumber: null,
+      bic: 'BBVAESMMXXX', bankName: 'Banco Bilbao Vizcaya Argentaria SA',
+    },
+    subtotal: 800.0, tax: 0.0, total: 800.0,
+    lines: [{
+      description: 'Sesiones de Coaching Ejecutivo (Diciembre y Enero)',
+      quantity: 2, unitPrice: 400, lineTotal: 800, taxCode: null, taxRate: 0,
+    }],
+  }),
 } satisfies Record<string, ExtractionResult>;
+
+/** The scenarios transcribed from real supplied documents rather than invented. */
+export const REAL_DOCUMENT_SCENARIOS = ['arenamedia', 'ready4people'] as const;
 
 export type ScenarioName = keyof typeof SCENARIOS;
 

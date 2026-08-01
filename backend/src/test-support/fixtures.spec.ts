@@ -28,7 +28,9 @@ function pythonScenarios(): Map<string, string> {
 
   // Each entry looks like:   "cleanpo": invoice(\n  number="INV-1001", ...
   const found = new Map<string, string>();
-  const entry = /"([a-z]+)":\s*invoice\(([\s\S]*?)\n\s*\),/g;
+  // [a-z0-9]: scenario keys can contain digits ("ready4people"). Matching only [a-z]+ silently
+  // skipped that entry, so the two corpora looked out of step when they were not.
+  const entry = /"([a-z0-9]+)":\s*invoice\(([\s\S]*?)\n\s*\),/g;
   for (const [, name, args] of body.matchAll(entry)) {
     const number = /number="([^"]+)"/.exec(args);
     assert.ok(number, `scenario "${name}" in mock_server.py has no number=`);

@@ -94,8 +94,8 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ## Tests
 
 ```bash
-cd backend && npm test               # 103 unit tests — no DB, no server
-cd backend && npm run test:integration   # 36 integration tests — needs DATABASE_URL
+cd backend && npm test               # 118 unit tests — no DB, no server
+cd backend && npm run test:integration   # 45 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -219,6 +219,25 @@ node — there's a regression test for exactly that.
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
   `correctionBlockedByApproval`), and the fixture drift guard.
+- **Locale-correct field parsing** (`parseDateOrThrow`, `parseMoneyOrThrow`) — found by the
+  first two real invoices, both of which the previous parsers got wrong:
+  - `new Date('04/05/2026')` returned **5 April** for a Spanish invoice dated **4 May**. Wrong
+    by a month, silently. On the same document the due date `03/06/2026` (3 June) became
+    6 March — *before* the invoice date, so it would read as long overdue and drive a wrong
+    payment run. And `23/01/2026` threw a 400, because there is no month 23. Roughly half the
+    year corrupted silently and the other half failed loudly.
+    Now: ISO first, then day-first `DD/MM/YYYY`, impossible dates rejected rather than rolled
+    over, and `new Date()` never allowed to guess. **Day-first is a deliberate locale choice**
+    that belongs in per-tenant config before the first US customer.
+  - `parseMoneyOrThrow` accepted only `1234.56`, so `10.000,00` and `800,00` — the amounts as
+    printed on both invoices — were rejected outright. Worse, `1.50` was read as one-and-a-half
+    when a European operator typing what the document shows for one thousand five hundred
+    means `1.500`: a silent factor-of-1000 error on a money field. Now both conventions parse
+    (last separator wins), and genuinely ambiguous input like `1.500` is **refused** rather
+    than guessed.
+  - `GET /files/:name` served a real PDF with **no `Content-Type`** — the extraction service
+    would have had to guess from the extension before a vision call that must declare a media
+    type. Now set from the stored name, plus `Cache-Control: private, no-store`.
 - **Developer plane (Phase 0)** — the first automated checks this repo has had, and the first
   way to stand it up that isn't "a developer with psql access".
   - **`npm run db:seed`** (`src/db/seed.ts`) — tenants, users, GL accounts, cost centres,
@@ -456,11 +475,20 @@ Configuration-as-data plus a good connector interface covers the real cases with
 customers a way to break their own tenant.
 
 ## Not yet built (in rough priority order)
-1. **One real extraction run.** The vision path in `extraction-service/main.py` fetches the
-   document and calls Claude, and uploads now feed it a genuine URL — but no real PDF and no
-   real `ANTHROPIC_API_KEY` has ever gone through it. Every result in this repo, including the
-   screenshots, came from `mock_server.py`. Until this runs once, the extraction claims are
-   unverified.
+1. **One real extraction run — still the top gap, but now half-closed.**
+   Two genuine invoices have been through the system (Arena Media Comunicaciones España S.A.
+   and Ready4people Development S.L., both billing PUMA ITALIA SRL). What that proved:
+   - The real PDFs upload, store and serve back **byte-identical** (md5 verified), and the
+     extraction service can fetch one and base64 it — the exact payload `main.py` would send.
+   - The pipeline handles them: non-PO path, 0% reverse-charge VAT, accented vendor names,
+     European amounts and dates, through approval, coding and posting to ERP doc 5117487728.
+   - `src/test-support/fixtures.ts` now carries both as permanent scenarios, and
+     `real-documents.int-spec.ts` runs them on every CI run.
+   What it did **not** prove, and this is the part that remains open: the field values were
+   **transcribed by hand from the PDFs**, not produced by the extraction service. There is
+   still no `ANTHROPIC_API_KEY` here, so the vision call has never executed and extraction
+   accuracy is still entirely unmeasured. Give the service a key and re-run these two
+   documents — the fixtures are the answer key to compare against.
 2. **Real auth** — *now also the gate on the whole config plane, see above.*
    SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
    workspace's "acting as" picker. This is also what makes the approver check real:

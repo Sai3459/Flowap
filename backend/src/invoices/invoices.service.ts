@@ -147,23 +147,131 @@ function lowConfidenceFieldNames(fieldConfidence: unknown): string[] {
     .map(([name]) => name);
 }
 
+/**
+ * Parses a date without ever letting `new Date()` guess.
+ *
+ * This used to be `new Date(raw)`, which silently corrupts European dates. On a real Spanish
+ * invoice, `04/05/2026` means 4 May 2026; `new Date()` reads it as 5 April — wrong by a
+ * month, with no error. On the same document the due date `03/06/2026` (3 June) became
+ * 6 March, i.e. *before* the invoice date, which would show the invoice as long overdue and
+ * feed a wrong payment run. And `23/01/2026` threw a 400 outright, because there is no month
+ * 23 — so roughly half the year silently corrupts and the other half fails loudly.
+ *
+ * Accepted, in order: ISO `YYYY-MM-DD` (what the extraction prompt asks for, and what a date
+ * picker sends), then `DD/MM/YYYY` or `DD.MM.YYYY` or `DD-MM-YYYY`.
+ *
+ * **Day-first is a deliberate locale choice, not a universal truth.** `05/04/2026` is
+ * genuinely ambiguous between locales and this reads it as 5 April. Every document the system
+ * has seen so far is European, so day-first is the right default here — but this belongs in
+ * per-tenant configuration before the first US customer, and the ambiguity cannot be resolved
+ * from the string alone. ISO input is never ambiguous and is always preferred.
+ */
 function parseDateOrThrow(raw: string, field: string): Date {
-  const parsed = new Date(raw.trim());
-  if (Number.isNaN(parsed.getTime())) {
-    throw new BadRequestException(`${field} must be a valid date (got "${raw}")`);
+  const trimmed = raw.trim();
+
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (iso) {
+    const [, y, m, d] = iso;
+    return buildDateOrThrow(Number(y), Number(m), Number(d), raw, field);
+  }
+
+  const dayFirst = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(trimmed);
+  if (dayFirst) {
+    const [, d, m, y] = dayFirst;
+    return buildDateOrThrow(Number(y), Number(m), Number(d), raw, field);
+  }
+
+  throw new BadRequestException(
+    `${field} must be YYYY-MM-DD or DD/MM/YYYY (got "${raw}")`,
+  );
+}
+
+/** Rejects impossible calendar dates rather than letting Date roll them over silently. */
+function buildDateOrThrow(year: number, month: number, day: number, raw: string, field: string): Date {
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const rolled =
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day;
+  if (Number.isNaN(parsed.getTime()) || rolled) {
+    throw new BadRequestException(`${field} is not a real date (got "${raw}")`);
   }
   return parsed;
 }
 
-/** Returns a string, not a number: currency stays out of floating point end to end. */
+/**
+ * Returns a string, not a number: currency stays out of floating point end to end.
+ *
+ * Handles both decimal conventions, because real invoices use both. The previous version
+ * accepted only `1234.56`, so every amount as printed on a European invoice — `10.000,00`,
+ * `800,00`, `1.234,56` — was rejected with a 400. Worse, `1.50` was accepted as one-and-a-half
+ * when a European operator typing what the document shows for one thousand five hundred means
+ * `1.500`: a silent factor-of-1000 error on a money field.
+ *
+ * The rule: whichever of `.` or `,` appears last is the decimal separator, and the other is
+ * a thousands separator. When only one separator appears and it could be either — `1.500`,
+ * `10,000` — the input is genuinely ambiguous and is **refused** rather than guessed, because
+ * guessing wrong on an amount is a thousand-fold error nobody would spot downstream.
+ */
 function parseMoneyOrThrow(raw: string, field: string): string {
-  const trimmed = raw.trim();
-  if (!/^-?\d+(\.\d{1,2})?$/.test(trimmed)) {
+  // Currency symbols and spaces (including the non-breaking kind pasted out of a PDF).
+  const cleaned = raw.trim().replace(/[€$£\s ]/g, '');
+  if (!cleaned) throw new BadRequestException(`${field} must be an amount (got "${raw}")`);
+
+  const negative = cleaned.startsWith('-');
+  const body = negative ? cleaned.slice(1) : cleaned;
+
+  if (!/^[\d.,]+$/.test(body)) {
+    throw new BadRequestException(`${field} must be an amount (got "${raw}")`);
+  }
+
+  const lastDot = body.lastIndexOf('.');
+  const lastComma = body.lastIndexOf(',');
+  let integerPart: string;
+  let decimalPart = '';
+
+  if (lastDot >= 0 && lastComma >= 0) {
+    // Both present: the later one is the decimal separator.
+    const decimalAt = Math.max(lastDot, lastComma);
+    integerPart = body.slice(0, decimalAt).replace(/[.,]/g, '');
+    decimalPart = body.slice(decimalAt + 1);
+  } else if (lastDot >= 0 || lastComma >= 0) {
+    const sep = lastDot >= 0 ? '.' : ',';
+    const at = Math.max(lastDot, lastComma);
+    const after = body.slice(at + 1);
+    const occurrences = body.split(sep).length - 1;
+
+    if (occurrences > 1 || after.length === 3) {
+      // Repeated separator is unambiguously grouping (1.234.567). A single separator with
+      // exactly three digits after it could be either, so it is only safe to read as
+      // grouping when the alternative is impossible — which it is not.
+      if (occurrences > 1) {
+        integerPart = body.replace(/[.,]/g, '');
+      } else {
+        throw new BadRequestException(
+          `${field} is ambiguous: "${raw}" could be ${body.replace(sep, '')} or ` +
+            `${body.replace(sep, '.')}. Write it as ${body.replace(sep, '')} or ` +
+            `${body.replace(sep, '.')}0 to be explicit.`,
+        );
+      }
+    } else if (after.length <= 2) {
+      integerPart = body.slice(0, at).replace(/[.,]/g, '');
+      decimalPart = after;
+    } else {
+      throw new BadRequestException(`${field} has too many decimal places (got "${raw}")`);
+    }
+  } else {
+    integerPart = body;
+  }
+
+  if (!/^\d+$/.test(integerPart) || (decimalPart && !/^\d{1,2}$/.test(decimalPart))) {
     throw new BadRequestException(
       `${field} must be a number with at most 2 decimal places (got "${raw}")`,
     );
   }
-  return trimmed;
+
+  const normalised = decimalPart ? `${integerPart}.${decimalPart}` : integerPart;
+  return negative ? `-${normalised}` : normalised;
 }
 
 @Injectable()

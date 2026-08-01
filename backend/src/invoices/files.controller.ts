@@ -18,6 +18,14 @@ export class FilesController {
 
   @Get(':storedFilename')
   serve(@Param('storedFilename') storedFilename: string, @Res() res: Response) {
+    // Content-Type matters here: this endpoint exists so the extraction service can fetch the
+    // document, and a vision call has to declare the media type of what it is sending. Served
+    // without it, a real PDF came back as `content-type: null` — the extractor would have had
+    // to guess from the extension. Derived from the stored name because that is the only
+    // authority once the upload request is gone.
+    res.type(this.fileStorage.mimeTypeFor(storedFilename));
+    // Unguessable UUID or not, an invoice is confidential — keep it out of shared caches.
+    res.setHeader('Cache-Control', 'private, no-store');
     const stream = this.fileStorage.stream(storedFilename);
     stream.pipe(res);
   }

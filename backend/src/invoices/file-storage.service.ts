@@ -42,6 +42,22 @@ export class FileStorageService {
   }
 
   /** Streams a stored file back. Rejects anything that isn't a plain filename we generated. */
+  /**
+   * Media type for a stored file, from its extension — the stored name is the only thing left
+   * once the upload request is gone. Limited to what the upload endpoint accepts, so an
+   * unexpected extension falls back to a type no client will try to render.
+   */
+  mimeTypeFor(storedFilename: string): string {
+    const byExtension: Record<string, string> = {
+      '.pdf': 'application/pdf',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.webp': 'image/webp',
+    };
+    return byExtension[extname(storedFilename).toLowerCase()] ?? 'application/octet-stream';
+  }
+
   stream(storedFilename: string) {
     const safe = basename(storedFilename);
     const path = join(this.root, safe);

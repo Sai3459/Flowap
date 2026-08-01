@@ -3,6 +3,15 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import type { InvoiceDetail } from '../api/types';
 import { StatusPill } from '../components/ui';
+import { rectOf, useEffectsApi } from '../components/Effects';
+import { notifyInboxChanged } from '../lib/useInboxWatch';
+
+/** What the pipeline decided, in one line, for the confirmation card. */
+function outcomeOf(inv: InvoiceDetail): { title: string; tone: 'clear' | 'review' | 'blocked' } {
+  if (inv.status === 'EXCEPTION') return { title: 'Received — blocked', tone: 'blocked' };
+  if (inv.status === 'NEEDS_REVIEW') return { title: 'Received — needs review', tone: 'review' };
+  return { title: 'Invoice received', tone: 'clear' };
+}
 
 /**
  * The inbound app. Until this existed the only way an invoice could enter was a developer
@@ -13,7 +22,9 @@ import { StatusPill } from '../components/ui';
  */
 export function UploadPage() {
   const navigate = useNavigate();
+  const { lift } = useEffectsApi();
   const inputRef = useRef<HTMLInputElement>(null);
+  const dropRef = useRef<HTMLDivElement>(null);
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -23,14 +34,29 @@ export function UploadPage() {
     if (!files || files.length === 0) return;
     setBusy(true);
     setError(null);
+    // Captured before the first await: the dropzone does not move, but reading it up front
+    // keeps this identical to the approve path, where the origin control does disappear.
+    const from = rectOf(dropRef.current);
     const done: InvoiceDetail[] = [];
     try {
       // Sequential rather than parallel: ingestion runs the whole pipeline inline, and a
       // burst of concurrent extractions would just queue behind each other anyway.
       for (const file of Array.from(files)) {
-        done.push(await api.upload(file));
+        const invoice = await api.upload(file);
+        done.push(invoice);
+        const outcome = outcomeOf(invoice);
+        lift({
+          title: outcome.title,
+          tone: outcome.tone,
+          detail: invoice.vendorName ?? file.name,
+          stamp: invoice.invoiceNumber ?? undefined,
+          origin: from,
+        });
       }
       setResults((prev) => [...done, ...prev]);
+      // A document that cleared validation is already parked at an approval node — if that
+      // node is the acting user's, their queue just changed.
+      notifyInboxChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       if (done.length > 0) setResults((prev) => [...done, ...prev]);
@@ -43,6 +69,7 @@ export function UploadPage() {
   return (
     <>
       <div
+        ref={dropRef}
         className={`drop${over ? ' over' : ''}`}
         onDragOver={(e) => { e.preventDefault(); setOver(true); }}
         onDragLeave={() => setOver(false)}

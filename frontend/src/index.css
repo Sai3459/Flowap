@@ -358,3 +358,159 @@ select option { background: var(--panel); }
   .field { grid-template-columns: 1fr auto; }
   .field .v { grid-column: 1 / -1; }
 }
+
+/* ==========================================================================
+   Feedback effects — arrival alerts, the bulb pulse, and the 3D lift.
+   All of it is suppressed under prefers-reduced-motion (rule at the end of
+   this file): the messages still appear, they simply stop moving.
+   ========================================================================== */
+
+/* ---------- bulb pulse ----------
+   A slow breathe rather than a hard blink. Fast flashing is a genuine
+   accessibility hazard, and at ~2.4s this still reads as "act on me" across
+   a room without strobing. */
+@keyframes bulb {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(143, 184, 156, 0), 0 0 0 1px var(--clear) inset;
+    background: rgba(143, 184, 156, 0.14);
+  }
+  50% {
+    box-shadow: 0 0 18px 2px rgba(143, 184, 156, 0.45), 0 0 0 1px var(--clear) inset;
+    background: rgba(143, 184, 156, 0.30);
+  }
+}
+button.approve.bulb { animation: bulb 2.4s ease-in-out infinite; }
+button.approve.bulb:hover { animation-play-state: paused; }
+
+/* The waiting-count beacon in the sidebar and on the queue banner. */
+@keyframes beacon {
+  0%, 100% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(111, 166, 190, 0.5); }
+  70%      { transform: scale(1.05); opacity: 1; box-shadow: 0 0 0 7px rgba(111, 166, 190, 0); }
+}
+.beacon {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--inflight);
+  flex-shrink: 0;
+  animation: beacon 2s ease-out infinite;
+}
+.beacon.clear { background: var(--clear); }
+.beacon.review { background: var(--review); }
+
+/* ---------- arrival banner ---------- */
+@keyframes slab-in {
+  from { transform: translateY(-8px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+.arrival {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.85rem 1.05rem;
+  border: 1px solid rgba(111, 166, 190, 0.4);
+  border-left: 3px solid var(--inflight);
+  border-radius: var(--r);
+  background: linear-gradient(90deg, rgba(111,166,190,0.14), rgba(111,166,190,0.03));
+  animation: slab-in 420ms cubic-bezier(0.16, 0.9, 0.3, 1);
+}
+.arrival .n { font-family: var(--mono); font-size: 1.5rem; line-height: 1; color: var(--inflight); }
+.arrival .txt { display: flex; flex-direction: column; gap: 0.15rem; }
+.arrival .txt .t { font-weight: 600; }
+.arrival .txt .d { font-size: 0.82rem; color: var(--ink-dim); }
+
+/* ---------- toasts ---------- */
+.toast-stack {
+  position: fixed;
+  /* Clears the sticky topbar rather than covering its subtitle. */
+  top: 4rem; right: 1rem;
+  z-index: 120;
+  display: flex; flex-direction: column; gap: 0.5rem;
+  max-width: min(24rem, calc(100vw - 2rem));
+}
+@keyframes toast-in {
+  from { transform: translateX(18px) scale(0.98); opacity: 0; }
+  to   { transform: translateX(0) scale(1); opacity: 1; }
+}
+.toast {
+  display: flex; align-items: flex-start; gap: 0.7rem;
+  text-align: left;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--r);
+  border: 1px solid var(--hair);
+  background: var(--panel);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  animation: toast-in 320ms cubic-bezier(0.16, 0.9, 0.3, 1);
+  cursor: pointer;
+  font-family: var(--sans);
+}
+.toast .body { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.toast .t { font-size: 0.86rem; font-weight: 600; color: var(--ink); }
+.toast .d { font-size: 0.78rem; color: var(--ink-dim); }
+.toast.tone-clear    { border-left: 3px solid var(--clear); }
+.toast.tone-inflight { border-left: 3px solid var(--inflight); }
+.toast.tone-review   { border-left: 3px solid var(--review); }
+.toast.tone-posted   { border-left: 3px solid var(--posted); }
+.toast.tone-blocked  { border-left: 3px solid var(--blocked); }
+.toast.tone-clear .beacon   { background: var(--clear); }
+.toast.tone-review .beacon  { background: var(--review); }
+.toast.tone-posted .beacon  { background: var(--posted); }
+.toast.tone-blocked .beacon { background: var(--blocked); }
+
+/* ---------- 3D lift confirmation ----------
+   perspective belongs on the stage, not the card: it is what turns the card's
+   translateZ and rotateX into actual depth rather than a flat squash. */
+.lift-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  pointer-events: none;
+  perspective: 900px;
+  perspective-origin: 50% 45%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.lift {
+  transform-style: preserve-3d;
+  will-change: transform, opacity;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 1.6rem 2.4rem;
+  border-radius: 4px;
+  border: 1px solid var(--hair);
+  background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  box-shadow: 0 40px 90px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  text-align: center;
+}
+.lift .headline { font-size: 1.5rem; font-weight: 600; letter-spacing: -0.02em; }
+.lift .stamp {
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+}
+.lift.tone-clear    { border-top: 2px solid var(--clear); }
+.lift.tone-clear .headline, .lift.tone-clear .stamp { color: var(--clear); }
+.lift.tone-posted   { border-top: 2px solid var(--posted); }
+.lift.tone-posted .headline, .lift.tone-posted .stamp { color: var(--posted); }
+.lift.tone-inflight { border-top: 2px solid var(--inflight); }
+.lift.tone-inflight .headline, .lift.tone-inflight .stamp { color: var(--inflight); }
+.lift.tone-review   { border-top: 2px solid var(--review); }
+.lift.tone-review .headline, .lift.tone-review .stamp { color: var(--review); }
+.lift.tone-blocked  { border-top: 2px solid var(--blocked); }
+.lift.tone-blocked .headline, .lift.tone-blocked .stamp { color: var(--blocked); }
+
+/* The earlier blanket rule already wins on !important, but state it explicitly for the
+   effects so the intent is obvious to anyone editing them: nothing above should move.
+   (The 3D lift is driven by the Web Animations API, which CSS cannot switch off — that
+   one checks the same media query in Effects.tsx.) */
+@media (prefers-reduced-motion: reduce) {
+  button.approve.bulb,
+  .beacon,
+  .arrival,
+  .toast,
+  .lift { animation: none !important; }
+  button.approve.bulb { box-shadow: 0 0 0 1px var(--clear) inset; background: rgba(143,184,156,0.24); }
+}

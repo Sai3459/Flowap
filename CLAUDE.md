@@ -260,6 +260,8 @@ node — there's a regression test for exactly that.
   to `POSTED` and stores a generated `erpDocumentNumber`. No ERP is contacted: a real connector
   replaces one method (`generateDocumentNumber`) and fills the same columns. Posting is
   terminal, and coding is frozen afterwards, because the ERP then holds the accounting document.
+  `GET /posting/ready` and `GET /posting/posted` join the vendor name in, like every other list
+  endpoint — they did not, so the posting screen's Vendor column read "—" on every row.
 - **Cost assignment (GL coding)** — `glAccounts` and `costCenters` synced by code, per-line
   `glAccountId`/`costCenterId`, `PATCH /invoices/:id/lines/:lineId/code`, a coding queue, and
   suggestions derived from how this tenant coded the same vendor before (evidence-based, so the
@@ -290,6 +292,28 @@ node — there's a regression test for exactly that.
   - **My approvals** — inbox with approve / reject / delegate, plus personal decision history.
   - **Posting** — ready-to-post list gated on coding, and everything already posted.
   - **Purchase orders** — orders, lines, goods-receipt entry, and a PO sync form.
+- **Feedback effects** (`frontend/src/components/Effects.tsx`, styles at the end of `index.css`).
+  Three pieces, all suppressed under `prefers-reduced-motion`:
+  - **Arrival.** `useInboxWatch` (`lib/useInboxWatch.ts`) polls the acting user's queue every
+    15s from the shell, so an invoice reaching them raises a toast wherever they are, plus a
+    beacon on the sidebar item and a banner on the queue itself. It diffs **step ids**, not
+    counts — a poll where one step is decided and another arrives leaves the count unchanged.
+    Screens that change the queue call `notifyInboxChanged()` so the badge moves on the same
+    tick instead of lagging up to 15s. This is the in-app half of the notification gap; it
+    still only reaches someone with the tab open.
+  - **The bulb.** `button.approve.bulb` breathes on a 2.4s cycle. Deliberately a breathe and
+    not a blink — fast flashing is a seizure hazard — and it pauses on hover.
+  - **The 3D lift.** A confirmation card that rises *out of the control you pressed*: the
+    origin's `DOMRect` is captured at click time (`rectOf()`), and a Web Animation carries the
+    card from that point at `translateZ(-420px) rotateX(62deg) scale(0.35)` up to rest, holds,
+    then floats away. Fires on approve (sage), reject (clay), upload (tone follows the
+    pipeline's verdict) and post (neutral, stamped with the ERP document number).
+    Two things are load-bearing: the rect must be captured at click time, because the row is
+    usually unmounted by the time the request resolves and a detached node measures all-zero;
+    and easing is **per-keyframe** with the animation-level easing linear, because one
+    aggressive ease-out across the whole thing collapses the rise into the first ~8% and the
+    card just appears. Verified by scrubbing the animation in a real browser: at 250ms it is
+    at scale 0.74 / z −162 / opacity 0.55, settled by 1700ms, gone by 2600ms.
 
 ## Not yet built (in rough priority order)
 1. **One real extraction run.** The vision path in `extraction-service/main.py` fetches the
@@ -306,9 +330,12 @@ node — there's a regression test for exactly that.
 3. **A real ERP connector.** Posting is simulated: the document number is generated locally.
    `erpConnections` still stores config with no connector logic. Nothing pulls purchase orders,
    GL accounts, cost centres or vendors from an ERP either — all four are pushed in by hand.
-4. **Notifying the next approver.** Approval is pull-only: a step is created and the approver
-   has to look in their inbox. No email, no push, no digest. For a tool whose whole pitch is
-   removing friction, this is the most conspicuous missing piece after auth.
+4. **Notifying the next approver, outside the app.** In-app arrival is now covered — the
+   workspace polls the acting user's queue and announces new items (see "Feedback effects").
+   But that only reaches someone with the tab open: there is still no email, no push, no
+   digest, and no server-side notification of any kind. The poll is also per-open-tab, which
+   is fine for a prototype and is not how this should work at volume; the eventual answer is
+   the server emitting an event when a step is created.
 5. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
 6. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
    frequency counts over this vendor's history, not a model call), plain-language explanations

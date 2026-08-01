@@ -3,6 +3,7 @@ import { NavLink, Route, Routes, useLocation } from 'react-router-dom';
 import { api, session } from './api/client';
 import type { TenantUser } from './api/types';
 import { useApi } from './lib/useApi';
+import { useInboxWatch } from './lib/useInboxWatch';
 import { DashboardPage } from './pages/DashboardPage';
 import { InvoicesPage } from './pages/InvoicesPage';
 import { InvoiceDetailPage } from './pages/InvoiceDetailPage';
@@ -31,18 +32,26 @@ const TITLES: [RegExp, string, string][] = [
  * stand in for a login the backend does not have yet — see CLAUDE.md. Everything downstream
  * reads `session`, so when SSO arrives this panel is deleted and nothing else changes.
  */
-function IdentityPanel({ users }: { users: TenantUser[] }) {
+function IdentityPanel({
+  users,
+  user,
+  setUser,
+}: {
+  users: TenantUser[];
+  user: string;
+  setUser: (id: string) => void;
+}) {
   const [tenant, setTenant] = useState(session.tenantId());
-  const [user, setUser] = useState(session.userId());
 
-  // Default to the first approver so the inbox is not empty on a fresh load.
+  // Default to the first approver so the inbox is not empty on a fresh load. This lives in
+  // App's state rather than the panel's because the queue watcher needs the same value.
   useEffect(() => {
     if (!user && users.length > 0) {
       const preferred = users.find((u) => u.role !== 'AP_CLERK') ?? users[0];
       session.setUserId(preferred.id);
       setUser(preferred.id);
     }
-  }, [users, user]);
+  }, [users, user, setUser]);
 
   return (
     <div className="identity">
@@ -72,6 +81,10 @@ export default function App() {
   const tenantId = session.tenantId();
   const { data: users } = useApi<TenantUser[]>(() => api.listUsers(), []);
   const { data: summary } = useApi(() => api.dashboard(), [location.pathname]);
+  const [actingUser, setActingUser] = useState(session.userId());
+
+  // Announces invoices arriving in the acting user's queue from anywhere in the workspace.
+  const { waiting } = useInboxWatch(actingUser);
 
   const [, title, subtitle] = TITLES.find(([re]) => re.test(location.pathname)) ?? [null, 'Flowap', ''];
 
@@ -79,7 +92,6 @@ export default function App() {
     review: summary?.byStatus
       .filter((s) => s.status === 'NEEDS_REVIEW' || s.status === 'EXCEPTION')
       .reduce((a, s) => a + s.count, 0) ?? 0,
-    approvals: summary?.awaitingApproval.count ?? 0,
     posting: summary?.byStatus.find((s) => s.status === 'APPROVED')?.count ?? 0,
     invoices: summary?.totals.invoices ?? 0,
   };
@@ -120,7 +132,10 @@ export default function App() {
           <NavLink to="/coding">Cost assignment</NavLink>
 
           <div className="nav-group"><span className="lbl">Approve</span></div>
-          <NavLink to="/inbox">My approvals <span className="count">{counts.approvals}</span></NavLink>
+          <NavLink to="/inbox">
+            {waiting > 0 && <span className="beacon" />}
+            My approvals <span className="count">{waiting}</span>
+          </NavLink>
 
           <div className="nav-group"><span className="lbl">Output</span></div>
           <NavLink to="/posting">Posting <span className="count">{counts.posting}</span></NavLink>
@@ -129,7 +144,7 @@ export default function App() {
           <NavLink to="/purchase-orders">Purchase orders</NavLink>
         </nav>
 
-        <IdentityPanel users={users ?? []} />
+        <IdentityPanel users={users ?? []} user={actingUser} setUser={setActingUser} />
       </aside>
 
       <div className="main">

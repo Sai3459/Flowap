@@ -4,6 +4,7 @@ import { api, session } from '../api/client';
 import type { InvoiceListItem, ReadyToPostItem } from '../api/types';
 import { useApi } from '../lib/useApi';
 import { Empty, ErrorNote, Loading, Money } from '../components/ui';
+import { rectOf, useEffectsApi } from '../components/Effects';
 
 /**
  * Posting — the last step, handing an approved invoice back to the ERP.
@@ -13,19 +14,27 @@ import { Empty, ErrorNote, Loading, Money } from '../components/ui';
  * know whether it exists in the ledger or not.
  */
 export function PostingPage() {
+  const { lift } = useEffectsApi();
   const ready = useApi<ReadyToPostItem[]>(() => api.readyToPost());
   const posted = useApi<InvoiceListItem[]>(() => api.postedInvoices());
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
-  async function post(invoiceId: string, label: string) {
+  async function post(invoiceId: string, label: string, from?: DOMRect) {
     setBusy(invoiceId);
     setError(null);
     setFlash(null);
     try {
       const result = await api.postInvoice(invoiceId, session.userId() || undefined);
       setFlash(`${label} posted as ERP document ${result.erpDocumentNumber}.`);
+      lift({
+        title: 'Posted to the ERP',
+        detail: `${label} · simulated document number`,
+        stamp: result.erpDocumentNumber ?? undefined,
+        tone: 'posted',
+        origin: from,
+      });
       ready.reload();
       posted.reload();
     } catch (err) {
@@ -71,7 +80,11 @@ export function PostingPage() {
                     </td>
                     <td>
                       {inv.uncodedLines === 0 ? (
-                        <button className="primary" disabled={busy === inv.id} onClick={() => void post(inv.id, inv.invoiceNumber ?? 'Invoice')}>
+                        <button
+                          className="primary"
+                          disabled={busy === inv.id}
+                          onClick={(e) => void post(inv.id, inv.invoiceNumber ?? 'Invoice', rectOf(e.currentTarget))}
+                        >
                           {busy === inv.id ? 'Posting…' : 'Post to ERP'}
                         </button>
                       ) : (

@@ -4,15 +4,19 @@ import { api, session } from '../api/client';
 import type { ApprovalHistoryItem, InboxItem, TenantUser } from '../api/types';
 import { useApi } from '../lib/useApi';
 import { Empty, ErrorNote, Loading, Money, StatusPill, StepPill } from '../components/ui';
+import { rectOf, useEffectsApi } from '../components/Effects';
+import { notifyInboxChanged } from '../lib/useInboxWatch';
 
 /**
  * The approval app: one person's queue and their decision history.
  *
  * This is a **pull** model. Nothing emails or notifies the next approver when their turn
- * arrives — their step is simply created and appears here. That is a genuine gap versus a
- * production AP tool, and this screen is what keeps it workable in the meantime.
+ * arrives — their step is simply created and appears here. `useInboxWatch` in App.tsx now
+ * announces arrivals in-app, but that only reaches someone with the tab open; real
+ * notification is still unbuilt.
  */
 export function ApprovalsPage() {
+  const { lift } = useEffectsApi();
   const approverId = session.userId();
   const [tab, setTab] = useState<'inbox' | 'history'>('inbox');
   const [busyStep, setBusyStep] = useState<string | null>(null);
@@ -27,15 +31,24 @@ export function ApprovalsPage() {
 
   if (!approverId) return <div className="notice">Pick who you are acting as in the sidebar first.</div>;
 
-  async function act(stepId: string, fn: () => Promise<unknown>, message: string) {
+  async function act(
+    stepId: string,
+    fn: () => Promise<unknown>,
+    message: string,
+    confirm?: { title: string; detail?: string; stamp?: string; tone: 'clear' | 'blocked'; from?: DOMRect },
+  ) {
     setBusyStep(stepId);
     setError(null);
     setFlash(null);
     try {
       await fn();
       setFlash(message);
+      // Fire the confirmation before reloading: the lift is anchored to a rect captured at
+      // click time, so it stays correct even as the row it came from disappears beneath it.
+      if (confirm) lift({ ...confirm, origin: confirm.from });
       inbox.reload();
       history.reload();
+      notifyInboxChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -63,6 +76,19 @@ export function ApprovalsPage() {
         : (inbox.data ?? []).length === 0 ? <Empty>Nothing is waiting on you.</Empty>
         : (
           <div className="stack">
+            <div className="arrival">
+              <span className="beacon" />
+              <span className="n">{(inbox.data ?? []).length}</span>
+              <span className="txt">
+                <span className="t">
+                  {(inbox.data ?? []).length === 1
+                    ? 'Invoice ready to be approved'
+                    : 'Invoices ready to be approved'}
+                </span>
+                <span className="d">Each one is parked at a node in its workflow, waiting on your decision.</span>
+              </span>
+            </div>
+
             {(inbox.data ?? []).map((item) => {
               const overdue = item.step.slaDueAt && new Date(item.step.slaDueAt) < new Date();
               return (
@@ -99,18 +125,32 @@ export function ApprovalsPage() {
                       onChange={(e) => setComment({ ...comment, [item.step.id]: e.target.value })}
                     />
                     <button
-                      className="approve"
+                      className="approve bulb"
                       disabled={busyStep === item.step.id}
-                      onClick={() => act(item.step.id,
+                      onClick={(e) => act(item.step.id,
                         () => api.decide(item.step.id, 'APPROVE', approverId, comment[item.step.id]),
-                        `Approved ${item.invoiceNumber ?? 'invoice'}.`)}
+                        `Approved ${item.invoiceNumber ?? 'invoice'}.`,
+                        {
+                          title: 'Invoice approved',
+                          detail: item.vendorName ?? 'unresolved vendor',
+                          stamp: item.invoiceNumber ?? undefined,
+                          tone: 'clear',
+                          from: rectOf(e.currentTarget),
+                        })}
                     >Approve</button>
                     <button
                       className="reject"
                       disabled={busyStep === item.step.id}
-                      onClick={() => act(item.step.id,
+                      onClick={(e) => act(item.step.id,
                         () => api.decide(item.step.id, 'REJECT', approverId, comment[item.step.id]),
-                        `Rejected ${item.invoiceNumber ?? 'invoice'}.`)}
+                        `Rejected ${item.invoiceNumber ?? 'invoice'}.`,
+                        {
+                          title: 'Invoice rejected',
+                          detail: item.vendorName ?? 'unresolved vendor',
+                          stamp: item.invoiceNumber ?? undefined,
+                          tone: 'blocked',
+                          from: rectOf(e.currentTarget),
+                        })}
                     >Reject</button>
                   </div>
 

@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
-import { auditEvents, invoiceLineItems, invoices } from '../db/schema';
+import { auditEvents, invoiceLineItems, invoices, vendors } from '../db/schema';
 
 /**
  * Hands an approved invoice back to the ERP.
@@ -84,26 +84,36 @@ export class PostingService {
     return lines.filter((l) => !l.glAccountId || !l.costCenterId).length;
   }
 
-  /** Invoices sitting at APPROVED with nothing left to do but post. */
+  /**
+   * Invoices sitting at APPROVED with nothing left to do but post.
+   *
+   * Vendor name is joined in here, as it is on every other list endpoint, so the caller
+   * never has to resolve `vendorId` itself.
+   */
   async findReadyToPost(tenantId: string) {
     const rows = await this.db
-      .select()
+      .select({ invoice: invoices, vendorName: vendors.name })
       .from(invoices)
+      .leftJoin(vendors, eq(invoices.vendorId, vendors.id))
       .where(and(eq(invoices.tenantId, tenantId), eq(invoices.status, 'APPROVED')));
 
     return Promise.all(
-      rows.map(async (invoice) => ({
+      rows.map(async ({ invoice, vendorName }) => ({
         ...invoice,
+        vendorName,
         uncodedLines: await this.uncodedLineCount(invoice.id),
       })),
     );
   }
 
   async findPosted(tenantId: string) {
-    return this.db
-      .select()
+    const rows = await this.db
+      .select({ invoice: invoices, vendorName: vendors.name })
       .from(invoices)
+      .leftJoin(vendors, eq(invoices.vendorId, vendors.id))
       .where(and(eq(invoices.tenantId, tenantId), isNotNull(invoices.erpDocumentNumber)));
+
+    return rows.map(({ invoice, vendorName }) => ({ ...invoice, vendorName }));
   }
 
   /**

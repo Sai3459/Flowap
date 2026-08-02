@@ -94,7 +94,7 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ## Tests
 
 ```bash
-cd backend && npm test               # 142 unit tests — no DB, no server
+cd backend && npm test               # 216 unit tests — no DB, no server
 cd backend && npm run test:integration   # 53 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
@@ -246,10 +246,12 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  103 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  216 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
-  `correctionBlockedByApproval`), and the fixture drift guard.
+  `correctionBlockedByApproval`), the fixture drift guard, vendor-name normalisation, the
+  inbound attachment decision, locale-aware date/money parsing, and the S/4HANA mappers
+  (OData wire format, auth, supplier invoice, purchase order, goods receipt).
 - **Email inbound** (`src/inbound/`) — the channel that makes "touchless" true at the front
   door. Until this, an invoice entered because a person dragged a PDF into a browser, which
   meant a human touched every document at the exact moment we claimed not to need one; in real
@@ -512,8 +514,20 @@ node — there's a regression test for exactly that.
 
 `src/erp/` — the connector contract plus the S/4HANA implementation. **Nothing has ever
 called SAP**: no tenant, no sandbox for this API, and SAP domains are unreachable from the
-build environment. What exists is built against the **real** `API_SUPPLIERINVOICE_PROCESS_SRV`
-v1.5.0 specification, checked in at `src/erp/s4hana/spec/`.
+build environment. What exists is built against the **real** OData specifications, checked in
+at `src/erp/s4hana/spec/`: `API_SUPPLIERINVOICE_PROCESS_SRV` v1.5.0,
+`API_PURCHASEORDER_PROCESS_SRV` v1.0.0, `API_MATERIAL_DOCUMENT_SRV` v1.5.0.
+
+**All three mappers are pure functions with no caller.** They are tested against the specs and
+correct as far as a spec can make them, but nothing in `src/` invokes them: there is no HTTP
+client, no sync job, no credential plumbing, and `erpConnections` still has zero code
+references. The mapping is the part that needed a specification to get right; the transport is
+the part that needs a tenant. Read them as "the hard half is done and unverified against a live
+system", not as a working connector.
+
+(Note: `CST_MaterialDocument` — SAP's Data Ingestion service — was ruled out deliberately. It
+is the wrong product and the wrong direction: it ingests *into* SAP's data platform rather than
+reading goods receipts *out of* S/4HANA.)
 
 - **The contract is deliberately narrow.** Flowap is an overlay, so a connector only pulls
   master data and pushes one document. `postInvoice` is optional, because a **read-only**
@@ -560,6 +574,34 @@ v1.5.0 specification, checked in at `src/erp/s4hana/spec/`.
   at the response root**, so a nested `$expand` arrives as a bare `{ results: [...] }`. Missing
   it yielded zero line items on every expanded read — a PO syncing with a correct header and no
   lines, which reads as a data problem rather than a parsing one.
+
+- **Goods receipts complete the third leg** (`s4-goods-receipt.ts`, built against
+  `API_MATERIAL_DOCUMENT_SRV` v1.5.0). A material document records *any* stock movement, so the
+  work is deciding what counts as "received against this PO line" — and the naive reading is
+  wrong four different ways:
+  - **Reversals must net out.** `GoodsMovementIsCancelled` marks a cancelled item and
+    `ReversedMaterialDocument` marks the document that reversed one; **both** are excluded, so
+    the pair disappears rather than either double-counting the delivery or driving received
+    below zero. This is the one that matters: over-receipt is a *hard stop*, so inflating
+    received quantity makes the check fire on correct invoices while hiding a genuine
+    over-delivery behind a reversal nobody reads.
+  - **Direction comes from `DebitCreditCode`** (`'H'` → −1), not the movement type. Treating
+    every movement as positive makes a return to the supplier look like a second delivery.
+  - **Units are never converted.** There are two quantity/unit pairs (`QuantityInEntryUnit`
+    /`EntryUnit`, `QuantityInBaseUnit`/`MaterialBaseUnit`) and the PO line has a third. We take
+    the one whose unit matches and otherwise **refuse** — 2 cases against a line in pieces is 2
+    or 24 depending on a factor this service doesn't carry, and either guess silently defeats
+    the over-receipt check. Refusals surface as `unitMismatches`, never as a zero, because an
+    invisible zero reads as "delivered nothing" and blocks a correct invoice.
+  - **The posting date is on the header only.** `A_MaterialDocumentItem` has
+    `ShelfLifeExpirationDate` and `ManufactureDate` and no posting date at all, so items read
+    directly come back undated unless `to_MaterialDocumentHeader` is expanded. Both expand
+    directions are handled.
+  Deliberately filters on `PurchaseOrder` being present rather than on
+  `GoodsMovementRefDocType`'s one-character code, whose values differ between releases — a
+  wrong letter would silently discard *every* receipt.
+  24 unit tests, and the three load-bearing ones were mutation-checked: breaking the reversal
+  exclusion, the unit refusal and the `DebitCreditCode` sign each fails the suite.
 
 **Schema additions still required before a connector can post** (none exist yet): `externalId`
 on vendors / purchase orders / GL accounts / cost centres, `companyCode`, `fiscalYear` beside
@@ -718,7 +760,7 @@ customers a way to break their own tenant.
 ### Known gaps in the frontend
 - **No tests at all.** Verified by driving a real browser against the running API, not by
   anything repeatable. No component tests, no e2e suite. This is now the largest untested
-  surface in the repo: ~2,600 lines of UI against 97 backend unit tests.
+  surface in the repo: ~2,600 lines of UI against 216 backend unit tests.
 - **Identity is picked, not authenticated.** Both the tenant field and the "acting as" role
   switcher are prototype affordances to be deleted when SSO lands, not adapted.
 - **No way to resolve an exception from the UI.** `invoiceExceptions.resolvedAt` is only ever

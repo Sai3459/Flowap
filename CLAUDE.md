@@ -508,6 +508,43 @@ node — there's a regression test for exactly that.
     card just appears. Verified by scrubbing the animation in a real browser: at 250ms it is
     at scale 0.74 / z −162 / opacity 0.55, settled by 1700ms, gone by 2600ms.
 
+## ERP connector (S/4HANA Cloud Public Edition)
+
+`src/erp/` — the connector contract plus the S/4HANA implementation. **Nothing has ever
+called SAP**: no tenant, no sandbox for this API, and SAP domains are unreachable from the
+build environment. What exists is built against the **real** `API_SUPPLIERINVOICE_PROCESS_SRV`
+v1.5.0 specification, checked in at `src/erp/s4hana/spec/`.
+
+- **The contract is deliberately narrow.** Flowap is an overlay, so a connector only pulls
+  master data and pushes one document. `postInvoice` is optional, because a **read-only**
+  connector is a legitimate first deliverable — it makes matching real against actual
+  procurement data while being incapable of changing anything in a customer's system.
+- **Park and post are separate calls, natively.** `POST /A_SupplierInvoice` does not accept
+  `SupplierInvoice` or `FiscalYear` (SAP assigns them), and there is a distinct
+  `POST /Post?SupplierInvoice=…&FiscalYear=…`. Creating without posting is therefore how the
+  API is designed, not a workaround — and it is the right first go-live posture, since a
+  wrongly parked document is a nuisance and a wrongly posted one is a journal entry to reverse.
+- **`FiscalYear` is mandatory to post**, so `invoices.erpDocumentNumber` alone is not enough:
+  an SAP document number is only unique within company code *and* fiscal year.
+- **Field lengths are enforced, never truncated** (`S4_FIELD_LIMITS`, taken from the spec).
+  `SupplierInvoiceIDByInvcgParty` is 16 characters; silently trimming an invoice number would
+  produce a document that reconciles against nothing and defeats SAP's own duplicate check.
+  `TaxCode` is **2** characters, so the code printed on a document can never pass through —
+  it always needs a per-tenant mapping.
+- **OData V2 wire format is handled explicitly** (`s4-odata.ts`): dates arrive as
+  `/Date(1748563200000)/` which `new Date()` turns into Invalid Date; decimals arrive as
+  strings on purpose and must not become floats; collections are `{ d: { results: [] } }`.
+  Malformed responses return null or an empty array rather than throwing, so one odd payload
+  cannot kill a sync job.
+- **Auth is an interface** (`s4-auth.ts`): `ApiKeyAuth` for the Hub sandbox, `BasicAuth` for a
+  communication user, `OAuth2ClientCredentialsAuth` for a real Cloud tenant. The token
+  refreshes 60s before expiry — a token expiring mid-*posting* yields a 401, and retrying a
+  posting is how duplicate accounting documents get created.
+
+**Schema additions still required before a connector can post** (none exist yet): `externalId`
+on vendors / purchase orders / GL accounts / cost centres, `companyCode`, `fiscalYear` beside
+`erpDocumentNumber`, a per-tenant tax-code map, and payment terms.
+
 ## Architecture direction (agreed, phased)
 
 The system has four planes, and until Phase 0 it had exactly one.

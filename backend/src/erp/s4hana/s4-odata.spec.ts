@@ -87,6 +87,14 @@ describe('OData V2 envelopes', () => {
     assert.deepEqual(odataCollection([{ a: 1 }]), [{ a: 1 }]);
   });
 
+  it('unwraps a nested expansion, which carries no d envelope', () => {
+    // The `d` wrapper appears only at the response root. `to_PurchaseOrderItem` and
+    // `to_SupplierInvoiceItemGLAcct` arrive as a bare { results: [...] }, and missing that
+    // yields zero line items on every expanded read — a PO syncing with a correct header and
+    // no lines, which looks like a data problem rather than a parsing one.
+    assert.deepEqual(odataCollection({ results: [{ a: 1 }, { a: 2 }] }), [{ a: 1 }, { a: 2 }]);
+  });
+
   it('returns an empty array rather than throwing on anything unexpected', () => {
     // A sync job must not die because one response came back shaped differently.
     for (const junk of [null, undefined, {}, { d: {} }, 'nonsense', 42]) {

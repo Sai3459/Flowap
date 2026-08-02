@@ -541,6 +541,26 @@ v1.5.0 specification, checked in at `src/erp/s4hana/spec/`.
   refreshes 60s before expiry — a token expiring mid-*posting* yields a 401, and retrying a
   posting is how duplicate accounting documents get created.
 
+- **The purchase order mapping found three things that change matching** (`s4-purchase-order.ts`,
+  built against `API_PURCHASEORDER_PROCESS_SRV` v1.0.0):
+  - **There is no line net amount.** SAP gives `NetPriceAmount` *and* `NetPriceQuantity` — the
+    price is quoted *per N units*. A line priced "12.00 per 100" with 500 ordered is 60.00, not
+    6,000.00. Multiplying quantity by price is the obvious reading and is wrong by a factor of
+    the price unit — the same shape as the gross-vs-net bug, and it would produce phantom
+    variance on every matched invoice.
+  - **`GoodsReceiptIsExpected` says whether the third way applies at all.** Not every line is
+    receipt-controlled; raising `GRN_MISMATCH` against a service line that never expected a
+    receipt would block a correct invoice.
+  - **`IsFinallyInvoiced` and `PurchasingDocumentDeletionCode` give us PO status**, which
+    Flowap has never had — see the "no PO is ever closed or cancelled" gap below. Deleted lines
+    and deleted orders are now dropped rather than matched.
+  Header totals are summed from the lines, since the service exposes no header net, which keeps
+  `validatePoPayload`'s invariant true by construction.
+- Writing those tests found a genuine bug in `odataCollection`: the `d` envelope appears **only
+  at the response root**, so a nested `$expand` arrives as a bare `{ results: [...] }`. Missing
+  it yielded zero line items on every expanded read — a PO syncing with a correct header and no
+  lines, which reads as a data problem rather than a parsing one.
+
 **Schema additions still required before a connector can post** (none exist yet): `externalId`
 on vendors / purchase orders / GL accounts / cost centres, `companyCode`, `fiscalYear` beside
 `erpDocumentNumber`, a per-tenant tax-code map, and payment terms.

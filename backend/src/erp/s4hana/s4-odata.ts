@@ -68,13 +68,27 @@ export function asAmountString(raw: unknown): string | null {
   return n === null ? null : n.toFixed(2);
 }
 
-/** Unwraps `{ d: { results: [...] } }`, `{ d: [...] }` or a bare array. Never throws. */
+/**
+ * Unwraps a collection. Never throws.
+ *
+ * Handles all four shapes this API actually produces, which is more than it sounds: the `d`
+ * envelope appears **only at the response root**, so a nested `$expand` — `to_PurchaseOrderItem`,
+ * `to_SupplierInvoiceItemGLAcct` — arrives as a bare `{ results: [...] }` with no `d`.
+ * Missing that case silently yields zero line items on every expanded read, which is exactly
+ * how a purchase order would sync with a correct header and no lines at all.
+ */
 export function odataCollection<T = Record<string, unknown>>(body: unknown): T[] {
   if (Array.isArray(body)) return body as T[];
+
   const d = (body as { d?: unknown })?.d;
   if (Array.isArray(d)) return d as T[];
-  const results = (d as { results?: unknown })?.results;
-  if (Array.isArray(results)) return results as T[];
+  const wrapped = (d as { results?: unknown })?.results;
+  if (Array.isArray(wrapped)) return wrapped as T[];
+
+  // Nested expansion: { results: [...] } with no envelope.
+  const bare = (body as { results?: unknown })?.results;
+  if (Array.isArray(bare)) return bare as T[];
+
   return [];
 }
 

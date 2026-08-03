@@ -44,9 +44,28 @@ project with `ts-node`, and keep `typescript` pinned to `5.7.3` in package.json 
 docker compose up --build
 docker compose run --rm backend npm run db:seed   # prints the tenant id the UI needs
 ```
-⚠️ The compose file and the three Dockerfiles have **never been executed** — they were written
-in a sandbox with the docker CLI but no daemon. The commands inside them are the ones used by
-hand below, but the wiring is unproven.
+⚠️ **The compose file and the three Dockerfiles have still never been built.** What is now
+known, after actually trying rather than assuming:
+
+- A Docker daemon **can** be started here (`dockerd` runs; the CLI reaches it, storage driver
+  overlayfs). The old note that this sandbox had "the CLI but no daemon" was only half right.
+- The blocker is the **network policy**, not Docker. `registry-1.docker.io` answers, but the
+  blob CDN `production.cloudfront.docker.com` is **403 policy-denied at the proxy gateway**, so
+  no base image (`node:22-alpine`, `python:3.11-slim`, `postgres:16-alpine`) can be pulled and
+  no build can start. Confirmed via `curl "$HTTPS_PROXY/__agentproxy/status"`, which logs the
+  denials. This is not something to work around — do not disable TLS verification or bypass the
+  proxy to chase it.
+
+What *has* been verified statically, which is more than nothing and less than a build:
+`docker compose config` validates — the file parses, every service/volume/build-context
+reference resolves, no undefined variables, and the `depends_on` health conditions are
+well-formed. All three Dockerfiles were read against known project gotchas: they use `ts-node`
+rather than `tsx` (see above), and **all three `.dockerignore` files exist** and exclude
+`node_modules`/`.venv`/`uploads`, so the classic "`COPY . .` clobbers the freshly installed
+dependency tree with the host's" bug is already handled.
+
+**Treat compose as reviewed-but-unbuilt.** Anyone on an unrestricted network should run
+`docker compose up --build` once and replace this note with the result.
 
 **The long way**, which is what every check in this repo has actually run against:
 ```bash
@@ -110,8 +129,17 @@ Test files run in separate processes concurrently by default, and they share one
 database, so integration runs are pinned to `--test-concurrency=1`. Without it the files
 truncate each other mid-run and everything fails at once.
 
-CI (`.github/workflows/ci.yml`) runs all four. ⚠️ The workflow has never executed — no runner
-was available where it was written — though every command in it passes locally.
+**CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 216 unit
+tests, 53 integration tests against a real `postgres:16-alpine` service container, 19 Python
+tests, and the frontend build. So the suites are proven to pass on a clean machine from
+scratch, not just on a developer's warm one. (This entry previously said the workflow had never
+executed. That was true when written and stayed in the file long after it stopped being true —
+check the Actions tab before repeating a claim like this.)
+
+⚠️ **CI passing is not evidence for `docker-compose.yml`.** The workflow contains zero
+references to compose or any Dockerfile — it uses a service container and runs commands
+directly on the runner. See below.
 
 ## Testing inbound mail
 
@@ -345,8 +373,9 @@ node — there's a regression test for exactly that.
     by breaking a number and watching it fail.
   - **`extraction-service/test_consistency.py`** — 19 tests for the arithmetic pass, which had
     none (see design decision 2).
-  - **`.github/workflows/ci.yml`**, **`docker-compose.yml`** and three Dockerfiles — written,
-    never executed. See the warnings in "How to run locally".
+  - **`.github/workflows/ci.yml`** — now green on GitHub's runners on every push (10 runs).
+    **`docker-compose.yml`** and the three Dockerfiles remain built-never, blocked on the image
+    registry rather than on Docker. See "How to run locally".
 - **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
   on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
   to disable). Escalations now fire without anyone calling the endpoint. Each breach is

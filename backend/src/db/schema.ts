@@ -81,12 +81,29 @@ export const users = pgTable('users', {
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
   email: text('email').notNull(),
   name: text('name').notNull(),
+  /**
+   * Flowap's own role, and deliberately **not** taken from the token.
+   *
+   * An IdP group claim says what someone is in the corporate directory; it does not get to
+   * say who may approve a payment here. Roles are provisioned in Flowap and read from this
+   * row, so a token asserting `role: ADMIN` grants nothing.
+   */
   role: text('role').notNull(), // AP_CLERK | AP_MANAGER | APPROVER | ADMIN | CONTROLLER
+  /**
+   * The OIDC `sub`, and the issuer that asserted it.
+   *
+   * Both, because `sub` is only unique **within** an issuer — two IdPs can each emit
+   * `sub: "12345"` for different people, and storing the subject alone would let one collide
+   * onto the other's user row. The composite unique index below is what stops two identities
+   * resolving to one account.
+   */
   ssoSubject: text('sso_subject'),
+  ssoIssuer: text('sso_issuer'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantEmailUnique: unique().on(t.tenantId, t.email),
   tenantIdx: index('users_tenant_idx').on(t.tenantId),
+  ssoIdentityUnique: unique('users_sso_identity_unique').on(t.ssoIssuer, t.ssoSubject),
 }));
 
 export const vendors = pgTable('vendors', {

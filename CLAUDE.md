@@ -113,8 +113,8 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ## Tests
 
 ```bash
-cd backend && npm test               # 216 unit tests — no DB, no server
-cd backend && npm run test:integration   # 53 integration tests — needs DATABASE_URL
+cd backend && npm test               # 246 unit tests — no DB, no server
+cd backend && npm run test:integration   # 66 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -130,8 +130,8 @@ database, so integration runs are pinned to `--test-concurrency=1`. Without it t
 truncate each other mid-run and everything fails at once.
 
 **CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 216 unit
-tests, 53 integration tests against a real `postgres:16-alpine` service container, 19 Python
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 246 unit
+tests, 66 integration tests against a real `postgres:16-alpine` service container, 19 Python
 tests, and the frontend build. So the suites are proven to pass on a clean machine from
 scratch, not just on a developer's warm one. (This entry previously said the workflow had never
 executed. That was true when written and stayed in the file long after it stopped being true —
@@ -274,12 +274,13 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  216 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  246 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
   `correctionBlockedByApproval`), the fixture drift guard, vendor-name normalisation, the
   inbound attachment decision, locale-aware date/money parsing, and the S/4HANA mappers
-  (OData wire format, auth, supplier invoice, purchase order, goods receipt).
+  (OData wire format, auth, supplier invoice, purchase order, goods receipt), and the
+  auth token verifier and identity-linking decision table.
 - **Email inbound** (`src/inbound/`) — the channel that makes "touchless" true at the front
   door. Until this, an invoice entered because a person dragged a PDF into a browser, which
   meant a human touched every document at the exact moment we claimed not to need one; in real
@@ -347,6 +348,14 @@ node — there's a regression test for exactly that.
     name, users by **email**, POs by `poNumber`, definitions by name), so re-running updates
     rather than duplicating and never touches transactional rows. Changing a seed email does
     not rename a user — it creates a second one and orphans the existing approval history.
+    ⚠️ **That idempotence does not survive a database whose workflow definitions have been
+    published or retired through the API.** Re-seeding then tries to set a definition
+    `PUBLISHED` while another already is, and the partial unique index
+    `workflow_one_published_per_tenant` refuses — `db:seed` dies part-way. Reproduced on
+    unmodified code, so it is not a regression from anything recent; a *fresh* database
+    (the documented path, and what CI exercises) is unaffected. The fix is for the seed to
+    retire the incumbent in the same transaction, exactly as `publishDefinition` does.
+    **Not yet fixed.**
   - **Integration harness** (`src/test-support/db.ts`) — derives a `_test` database from
     `DATABASE_URL`, creates it, pushes the schema, truncates every table between tests.
     Truncate rather than transaction-rollback because the services hold `DatabaseService.db`
@@ -356,7 +365,7 @@ node — there's a regression test for exactly that.
     classes with constructor injection, so `@nestjs/testing` buys nothing. Only the extractor
     is stubbed; matching, workflow traversal, coding, posting and the audit trail are all
     production code against real Postgres.
-  - **36 integration tests** (`*.int-spec.ts`) over the paths that were previously
+  - **66 integration tests** (`*.int-spec.ts`) over the paths that were previously
     hand-verified only: the nine ingestion scenarios end to end, net-vs-net PO comparison,
     duplicate detection, late-PO re-validation, workflow traversal, ALL/ANY node semantics,
     sibling skipping, delegation not deadlocking an ALL node, SLA inheritance on handoff, the
@@ -710,13 +719,42 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 `/feedback` loop remains a stub.
 
 ## Not yet built (in rough priority order)
-1. **Real auth** — *now also the gate on the whole config plane, see above.*
-   SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
-   workspace's "acting as" picker. This is also what makes the approver check real:
-   `decideStep`/`delegateStep` verify the caller is the step's assigned approver, but against a
-   **client-supplied** `approverId`. That stops wrong-user and accidental decisions; it is not
-   authorization until the id comes from a session. `assertIsAssignedApprover` then reads the
-   session subject — the check itself doesn't move. Same for `postedById`.
+1. **Real auth — Phase 1, now underway. 2 of 5 steps landed, and NOTHING IS WIRED YET.**
+   Until step 3, `x-tenant-id` is still exactly how tenants resolve: any caller can send any
+   tenant id and read that tenant's invoices. Do not read the presence of `src/auth/` as
+   meaning the API is protected.
+
+   Landed, both isolated from `app.module.ts`:
+   - **`jwt-verifier.ts`** — verifies an OIDC access token against the issuer's JWKS.
+     Asymmetric-only algorithm pin, issuer *and* audience both required, bounded clock skew.
+     Scope note established by mutation-testing rather than assumed: while the key source is a
+     JWKS, `jose` already refuses `alg: none` and refuses to resolve a symmetric key from a key
+     set, so the algorithm pin changes nothing *today* — it is defence-in-depth for a non-JWKS
+     key source, and there is a test using one that fails without it. The audience check, by
+     contrast, was load-bearing immediately.
+   - **`identity-link.ts` + `auth.service.ts`** — which Flowap user a verified token is. The
+     subject is the identity key, not the email; email may be used to *find* a user only on
+     first login and only when the IdP asserts `email_verified`; a user already bound to a
+     different subject is never re-linked; an email matching users in more than one tenant is
+     refused as ambiguous; and there is **no just-in-time provisioning** — a valid token for
+     someone with no Flowap user is refused, because the alternative makes the corporate
+     directory the list of people who can approve payments.
+   - **Schema:** `users.ssoIssuer` beside `ssoSubject`, plus
+     `UNIQUE (sso_issuer, sso_subject)`. Both columns, because `sub` is unique only *within*
+     an issuer — two IdPs can each emit `sub: "12345"`, and keying on the subject alone lets
+     one identity collide onto another's row, which across tenants is a cross-tenant breach.
+     Applied by `drizzle/0003_sso_identity.sql`, hand-written because `push` offers to
+     **truncate `users`** rather than add a constraint to a populated table.
+   - **Role never comes from the token.** An IdP group claim describes the corporate
+     directory; it does not decide who may approve a payment here. Tested: a token asserting
+     `role: ADMIN` yields the row's `APPROVER`.
+
+   Still to do: **3.** the global deny-by-default guard and `@CurrentUser()`, which is the
+   commit that actually removes `x-tenant-id` from all 40 endpoints · **4.** the approver
+   check reading the session instead of a client-supplied `approverId` (today it stops
+   wrong-user and accidental decisions, and is not authorization; same for `postedById`) ·
+   **5.** a local OIDC dev issuer, so development exercises the same verification path as
+   production rather than a bypass branch.
 2. **A real ERP connector.** Posting is simulated: the document number is generated locally.
    `erpConnections` still stores config with no connector logic. Nothing pulls purchase orders,
    GL accounts, cost centres or vendors from an ERP either — all four are pushed in by hand.
@@ -810,7 +848,7 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 ### Known gaps in the frontend
 - **No tests at all.** Verified by driving a real browser against the running API, not by
   anything repeatable. No component tests, no e2e suite. This is now the largest untested
-  surface in the repo: ~2,600 lines of UI against 216 backend unit tests.
+  surface in the repo: ~2,600 lines of UI against 246 backend unit tests.
 - **Identity is picked, not authenticated.** Both the tenant field and the "acting as" role
   switcher are prototype affordances to be deleted when SSO lands, not adapted.
 - **No way to resolve an exception from the UI.** `invoiceExceptions.resolvedAt` is only ever

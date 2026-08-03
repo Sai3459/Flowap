@@ -8,7 +8,10 @@ import {
 } from '@nestjs/common';
 import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { authoriseApproval } from '../authority/approval-authority';
 import {
+  tenants,
+  approvalAuthorities,
   approvalInstances,
   approvalSteps,
   auditEvents,
@@ -350,6 +353,17 @@ export class WorkflowEngineService {
     const { step, instance, graph, node } = await this.loadPendingStep(tenantId, stepId);
     this.assertIsAssignedApprover(step, dto.approverId);
 
+    // Being the assigned approver says the question was put to you. The Chart of Authority
+    // says whether you may answer *yes* to this amount. Checked here, against the decider,
+    // rather than when the step was created against whoever it was first assigned to — which
+    // is what stops a delegated €40k invoice being approved by a €5k junior.
+    //
+    // Only APPROVE. Refusing needs no spending authority, and requiring it would leave someone
+    // holding an invoice they could neither approve nor reject.
+    if (dto.decision === 'APPROVE') {
+      await this.assertHasApprovalAuthority(tenantId, instance.invoiceId, dto.approverId);
+    }
+
     await this.db
       .update(approvalSteps)
       .set({
@@ -630,6 +644,54 @@ export class WorkflowEngineService {
    * and accidental decisions, and becomes enforceable for real when `approverId` starts
    * coming from an SSO session instead of the request body.
    */
+  /**
+   * Refuses an approval the decider has no authority for, when the tenant enforces limits.
+   *
+   * Silent when `enforceApprovalLimits` is off, which is the default: turning the Chart of
+   * Authority on for every tenant at once would refuse every approval until somebody had
+   * populated it. Enforcement is something an administrator switches on once the table is
+   * filled in.
+   */
+  private async assertHasApprovalAuthority(tenantId: string, invoiceId: string, approverId: string) {
+    const [tenant] = await this.db.select().from(tenants).where(eq(tenants.id, tenantId));
+    if (!tenant?.enforceApprovalLimits) return;
+
+    const [invoice] = await this.db.select().from(invoices).where(eq(invoices.id, invoiceId));
+    if (!invoice) throw new NotFoundException('Invoice not found');
+
+    const rows = await this.db
+      .select()
+      .from(approvalAuthorities)
+      .where(and(eq(approvalAuthorities.tenantId, tenantId), eq(approvalAuthorities.userId, approverId)));
+
+    const outcome = authoriseApproval(
+      rows.map((r) => ({
+        userId: r.userId,
+        documentType: r.documentType,
+        currency: r.currency,
+        amountFrom: Number(r.amountFrom),
+        amountTo: Number(r.amountTo),
+        validFrom: r.validFrom,
+        validTo: r.validTo,
+      })),
+      {
+        userId: approverId,
+        totalAmount: invoice.totalAmount === null ? null : Number(invoice.totalAmount),
+        currency: invoice.currency,
+        documentType: invoice.documentType,
+        at: new Date(),
+      },
+    );
+
+    if (!outcome.authorised) {
+      await this.logAudit(tenantId, invoiceId, 'APPROVAL_REFUSED_NO_AUTHORITY', {
+        approverId,
+        reason: outcome.reason,
+      });
+      throw new ForbiddenException(outcome.reason);
+    }
+  }
+
   private assertIsAssignedApprover(step: ApprovalStepRow, claimedApproverId: string) {
     if (step.approverId !== claimedApproverId) {
       throw new ForbiddenException(`Step ${step.id} is not assigned to approver ${claimedApproverId}`);

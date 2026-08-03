@@ -73,8 +73,54 @@ export const tenants = pgTable('tenants', {
    * { pricePct, quantityPct, totalAmountAbs, blockOnOverReceipt }
    */
   matchTolerances: jsonb('match_tolerances'),
+  /**
+   * Whether `approvalAuthorities` is enforced for this tenant.
+   *
+   * Off by default, and that is a deliberate rollout choice rather than timidity: switching
+   * enforcement on for every tenant at deploy time would refuse every approval until somebody
+   * had populated a Chart of Authority, i.e. it would stop the product working. Off means the
+   * COA is inert until an administrator has entered limits and turned it on.
+   */
+  enforceApprovalLimits: boolean('enforce_approval_limits').default(false).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+/**
+ * The Chart of Authority: who may approve, up to how much, for what.
+ *
+ * This is the piece OpenText VIM calls the COA, and the reason it exists separately from the
+ * workflow graph is that the two answer different questions. The graph answers *what sequence*
+ * — which steps, which branches. The COA answers *who has authority* — and putting that in the
+ * graph, as amount thresholds on CONDITION nodes, means a routine change to one person's
+ * spending limit requires editing a published, versioned workflow definition that everyone
+ * else is also routed by.
+ *
+ * One row is one grant. A person needing authority for two currencies, or two document types,
+ * gets two rows; the row is the unit an auditor reads.
+ *
+ * **Currency is mandatory.** An amount band with no currency is not a limit — 10,000 EUR and
+ * 10,000 USD are different authorities, and treating a null as "any currency" would silently
+ * grant the larger of them.
+ */
+export const approvalAuthorities = pgTable('approval_authorities', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  /** INVOICE | CREDIT_NOTE | … — null means any document type. */
+  documentType: text('document_type'),
+  currency: text('currency').notNull(),
+  amountFrom: numeric('amount_from', { precision: 18, scale: 2 }).notNull().default('0'),
+  amountTo: numeric('amount_to', { precision: 18, scale: 2 }).notNull(),
+  /**
+   * Validity window, so cover during leave is data rather than a code change. Null `validTo`
+   * means open-ended, which is the ordinary case.
+   */
+  validFrom: timestamp('valid_from'),
+  validTo: timestamp('valid_to'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  tenantUserIdx: index('coa_tenant_user_idx').on(t.tenantId, t.userId),
+}));
 
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),

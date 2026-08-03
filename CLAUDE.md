@@ -121,8 +121,8 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 266 unit tests — no DB, no server
-cd backend && npm run test:integration   # 96 integration tests — needs DATABASE_URL
+cd backend && npm test               # 289 unit tests — no DB, no server
+cd backend && npm run test:integration   # 105 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -138,8 +138,8 @@ database, so integration runs are pinned to `--test-concurrency=1`. Without it t
 truncate each other mid-run and everything fails at once.
 
 **CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 266 unit
-tests, 96 integration tests against a real `postgres:16-alpine` service container, 19 Python
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 289 unit
+tests, 105 integration tests against a real `postgres:16-alpine` service container, 19 Python
 tests, and the frontend build. So the suites are proven to pass on a clean machine from
 scratch, not just on a developer's warm one. (This entry previously said the workflow had never
 executed. That was true when written and stayed in the file long after it stopped being true —
@@ -687,13 +687,67 @@ not. Mutation-checked: disabling the guard's role check fails 19 tests.
 server returns 403 regardless; the mirror in `App.tsx` only avoids showing people doors that
 will not open. Drift produces a visible 403, never unauthorised access.
 
+## Chart of Authority (`approvalAuthorities`)
+
+Who may approve, up to how much, for what — the piece OpenText VIM calls the COA. It exists
+**separately from the workflow graph** because the two answer different questions: the graph
+says *what sequence*, the COA says *who has authority*. Keeping limits in the graph, as amount
+thresholds on CONDITION nodes, meant a routine change to one person's spending limit required
+editing a published, versioned definition that routes everybody else too.
+
+One row is one grant (`src/authority/approval-authority.ts` is the pure decision table).
+
+**Enforced at decision time, against the decider.** Not when the step is created, and not
+against whoever it was first assigned to — and that choice is the whole point. **It closes the
+delegation hole**: a manager holding €50k delegates a €40k invoice to a junior holding €5k, and
+if authority were checked at assignment the junior's approval would stand. Verified with a test
+named after it.
+
+**Rejection needs no authority.** Only APPROVE is gated. Requiring authority to refuse would
+leave someone holding an invoice they could neither approve nor decline — a deadlock dressed as
+a control.
+
+**Currency is mandatory on a grant.** €10,000 of authority is not $10,000 of authority, and
+treating a null as "any currency" would silently grant whichever is worth more. Someone needing
+both gets two rows.
+
+**Enforcement is opt-in per tenant** (`tenants.enforceApprovalLimits`, default false). Turning
+it on globally at deploy time would refuse every approval until a COA had been populated — it
+would stop the product working. `POST /admin/authorities/enforcement` additionally **refuses to
+enable it while the table is empty**, because discovering that in production is much worse than
+being told at the switch.
+
+**An invoice with no total is refused, not treated as zero** — zero sails under every ceiling,
+and releasing an unknown amount is the failure the table exists to prevent.
+
+**Refusals name the shortfall** ("this invoice is 40000.00 EUR, above your approval limit of
+5000.00 EUR"), because the person hitting it is an approver doing their job and the useful next
+step is only obvious if they can see the limit. Each refusal is also written to the audit trail
+as `APPROVAL_REFUSED_NO_AUTHORITY`, so "why is this stuck" survives the 403 nobody screenshotted.
+The step stays `PENDING` — a refused approval must not consume it.
+
+**`GET /admin/authorities/who-can-approve?amount=&currency=`** answers the question the COA
+introduces: an invoice above everybody's limit. Without it that state is invisible until an
+approver is refused, which looks like a permissions bug rather than a configuration gap. It
+returns an explicit warning when the list is empty.
+
+Verified live: an admin granting EUR 500, enforcement refused while the table was empty, then a
+1296.00 USD invoice refused with *"You have no approval authority in USD"*, and `who-can-approve`
+reporting nobody for that amount and `manager1` for 400 EUR.
+
+### Known gaps in the Chart of Authority
+- **No company code and no cost-centre dimension.** Invoices carry no company code at all, and
+  cost centres are coded per *line*, so one invoice can span several and "the authority for this
+  invoice" stops being a single lookup. Both are listed rather than half-built.
+- **No substitute/delegate-of-record.** Cover during leave is expressible as a second row with a
+  validity window, but there is no explicit "X acts for Y" relationship.
+- **The COA does not select approvers, only enforces limits.** The graph still decides who is
+  asked. Selection — an APPROVAL node resolving its approvers *from* the COA — is the natural
+  next step and interacts with versioning and the "nobody is authorised" failure mode, so it was
+  deliberately left until enforcement was proven.
+- **No UI.** Grants are maintained over the API; the config plane's screens do not exist yet.
+
 ### Known gaps in authorization
-- **No Chart of Authority.** Approval *limits* are still expressed as CONDITION nodes on
-  amount inside the graph, so changing one person's spending authority means editing a
-  published workflow definition. A COA table (per-user limits by document type, company code,
-  cost centre, validity window) is the next piece; the agreed shape is enforcement-first —
-  check the decider's limit in `decideStep` — because that closes the delegation hole where a
-  manager hands a €40k invoice to a junior with a €5k limit.
 - **`POST /purchase-orders` is `AP_MANAGER`/`ADMIN` as an interim.** It is shaped for an ERP
   connector to replay idempotently, so it really wants a **service identity**, which does not
   exist yet.

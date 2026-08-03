@@ -3,6 +3,7 @@ import { createReadStream, existsSync, mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { extname, join, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { DEFAULT_TTL_SECONDS, signedPath, signingKey } from './signed-url';
 
 /**
  * Local disk storage for uploaded invoice documents.
@@ -37,8 +38,20 @@ export class FileStorageService {
       originalFilename: file.originalname,
       mimeType: file.mimetype,
       sizeBytes: file.buffer.length,
-      url: `${this.publicBase}/files/${storedFilename}`,
+      url: this.signedUrl(storedFilename),
     };
+  }
+
+  /**
+   * A signed, expiring URL for a stored document.
+   *
+   * The extraction service fetches this as an anonymous client, so the link itself has to carry
+   * the authorisation. Previously the URL was just the filename — an unguessable UUID, which is
+   * not a credential: it never expired, and anyone who saw it in a log or a proxy kept access
+   * forever.
+   */
+  signedUrl(storedFilename: string, ttlSeconds = DEFAULT_TTL_SECONDS): string {
+    return `${this.publicBase}${signedPath(storedFilename, signingKey(), ttlSeconds)}`;
   }
 
   /** Streams a stored file back. Rejects anything that isn't a plain filename we generated. */

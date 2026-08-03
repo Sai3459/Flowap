@@ -1,8 +1,9 @@
-import { Controller, Get, Param, Res } from '@nestjs/common';
+import { Controller, Get, Logger, NotFoundException, Param, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import { ApiTags } from '@nestjs/swagger';
 import { FileStorageService } from './file-storage.service';
 import { Public } from '../auth/public.decorator';
+import { signingKey, verify } from './signed-url';
 
 /**
  * Serves stored documents back over HTTP.
@@ -12,23 +13,40 @@ import { Public } from '../auth/public.decorator';
  * service fetches these URLs as an anonymous HTTP client — it is a separate Python process
  * with no Flowap session — so requiring a bearer token here would break ingestion.
  *
- * What protects a document today is only that its filename is an unguessable UUID. That is
- * adequate for a prototype and **not** adequate for production: an invoice PDF is
- * confidential, and a URL that never expires and needs no credential will end up in a log, a
- * proxy, or a browser history.
+ * So the link itself carries the authorisation: every URL is **signed and expiring**
+ * (`signed-url.ts`). That closes what an unguessable UUID could not — the signature is bound
+ * to one filename, so it cannot be replayed against another document; it expires, so a link
+ * leaked into a log or a proxy stops working; and it cannot be minted without the key.
  *
- * The fix is not to put a token on this route — it is to stop passing raw URLs at all:
- * **signed, expiring URLs** (or handing the extractor bytes over an authenticated internal
- * channel). Tracked as a known gap; see CLAUDE.md.
+ * Still not perfect, and worth knowing: within its TTL the link is a bearer credential for
+ * that one document. Shortening the TTL narrows that window; handing the extractor bytes over
+ * an authenticated internal channel would remove it entirely.
  */
 @ApiTags('files')
 @Controller('files')
 export class FilesController {
+  private readonly logger = new Logger(FilesController.name);
+
   constructor(private readonly fileStorage: FileStorageService) {}
 
   @Public()
   @Get(':storedFilename')
-  serve(@Param('storedFilename') storedFilename: string, @Res() res: Response) {
+  serve(
+    @Param('storedFilename') storedFilename: string,
+    @Query('exp') exp: string | undefined,
+    @Query('sig') sig: string | undefined,
+    @Res() res: Response,
+  ) {
+    // `@Public()` means unauthenticated, not unauthorised. The signature is the credential:
+    // it binds this link to this filename, expires, and cannot be minted without the key.
+    const result = verify(storedFilename, exp, sig, signingKey());
+    if (!result.ok) {
+      this.logger.warn(`Refused ${storedFilename}: signature ${result.reason}`);
+      // 404 rather than 403 on purpose. A distinct 403 would confirm the document exists,
+      // which is exactly what an unauthenticated caller must not be able to probe for.
+      throw new NotFoundException('Not found');
+    }
+
     // Content-Type matters here: this endpoint exists so the extraction service can fetch the
     // document, and a vision call has to declare the media type of what it is sending. Served
     // without it, a real PDF came back as `content-type: null` — the extractor would have had

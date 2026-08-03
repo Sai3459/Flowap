@@ -25,6 +25,7 @@ import { PostingModule } from '../posting/posting.module';
 import { CodingModule } from '../coding/coding.module';
 import { PurchaseOrdersModule } from '../purchase-orders/purchase-orders.module';
 import { InboundModule } from '../inbound/inbound.module';
+import { ErpModule } from '../erp/erp.module';
 import { tenants, users } from '../db/schema';
 import { ROLES, type Role } from './principal';
 
@@ -93,6 +94,16 @@ const MATRIX: { method: string; path: string; allow: Role[]; body?: unknown }[] 
 
   // ERP sync. Interim: this wants a service identity, not a human role.
   { method: 'POST', path: '/purchase-orders', allow: ['AP_MANAGER', 'ADMIN'], body: {} },
+
+  // ERP connections hold credentials that can post into a customer's ledger — ADMIN only.
+  { method: 'GET', path: '/admin/erp-connections', allow: ['ADMIN'] },
+  { method: 'POST', path: '/admin/erp-connections', allow: ['ADMIN'], body: {} },
+  { method: 'POST', path: '/admin/erp-connections/00000000-0000-0000-0000-000000000000/test', allow: ['ADMIN'] },
+  {
+    method: 'POST',
+    path: '/admin/erp-connections/00000000-0000-0000-0000-000000000000/sync/purchase-orders',
+    allow: ['ADMIN'],
+  },
 ];
 
 async function tokenFor(email: string): Promise<string> {
@@ -134,6 +145,7 @@ describe('role-based authorization', { skip: skipReason() }, () => {
         CodingModule,
         PurchaseOrdersModule,
         InboundModule,
+        ErpModule,
       ],
     })
       .overrideProvider(DatabaseService)

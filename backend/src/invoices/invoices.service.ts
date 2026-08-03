@@ -29,6 +29,7 @@ import {
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { WorkflowEngineService } from '../workflow/workflow-engine.service';
 import { VendorsService } from '../vendors/vendors.service';
+import { FileStorageService } from './file-storage.service';
 import type { Principal } from '../auth/principal';
 
 /** Metadata for a document uploaded through the UI rather than posted in as a URL. */
@@ -309,6 +310,7 @@ export class InvoicesService {
     private readonly extraction: ExtractionClientService,
     private readonly workflowEngine: WorkflowEngineService,
     private readonly vendorsService: VendorsService,
+    private readonly fileStorage: FileStorageService,
   ) {}
 
   private get db() {
@@ -966,7 +968,18 @@ export class InvoicesService {
       .from(invoiceExceptions)
       .where(eq(invoiceExceptions.invoiceId, id));
 
-    return { ...row.invoice, vendorName: row.vendorName, lineItems, exceptions };
+    return {
+      ...row.invoice,
+      // Re-signed on every read. `invoices.fileUrl` holds the URL as it was at ingest, whose
+      // signature has long expired by the time anyone opens the invoice — so the stored value
+      // is history, and the link the client gets is minted fresh.
+      fileUrl: row.invoice.storedFilename
+        ? this.fileStorage.signedUrl(row.invoice.storedFilename)
+        : row.invoice.fileUrl,
+      vendorName: row.vendorName,
+      lineItems,
+      exceptions,
+    };
   }
 
   private async logAudit(

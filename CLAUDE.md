@@ -117,7 +117,12 @@ npx drizzle-kit push --force   # applies schema — see src/db/schema.ts
 npm run db:seed                # tenants, users, GL/cost centres, PO-5000, workflow definitions
 # Authentication is required and fails closed: with neither OIDC_ISSUER nor AUTH_DEV_ISSUER
 # the process refuses to start rather than serving an unauthenticated API.
-AUTH_DEV_ISSUER=true npx ts-node src/main.ts        # NOT npx tsx
+# Two more secrets are required and both fail closed — the process refuses to start without
+# them rather than serving documents unsigned or storing ERP credentials in plaintext.
+AUTH_DEV_ISSUER=true \
+FILE_URL_SIGNING_KEY="$(openssl rand -hex 32)" \
+ERP_CREDENTIALS_KEY="$(openssl rand -hex 32)" \
+npx ts-node src/main.ts        # NOT npx tsx
 
 # 3. Extraction service (separate terminal)
 cd extraction-service
@@ -153,8 +158,8 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 289 unit tests — no DB, no server
-cd backend && npm run test:integration   # 105 integration tests — needs DATABASE_URL
+cd backend && npm test               # 336 unit tests — no DB, no server
+cd backend && npm run test:integration   # 119 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -170,8 +175,8 @@ database, so integration runs are pinned to `--test-concurrency=1`. Without it t
 truncate each other mid-run and everything fails at once.
 
 **CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 289 unit
-tests, 105 integration tests against a real `postgres:16-alpine` service container, 19 Python
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 336 unit
+tests, 119 integration tests against a real `postgres:16-alpine` service container, 19 Python
 tests, and the frontend build. So the suites are proven to pass on a clean machine from
 scratch, not just on a developer's warm one. (This entry previously said the workflow had never
 executed. That was true when written and stayed in the file long after it stopped being true —
@@ -787,11 +792,18 @@ reporting nobody for that amount and `manager1` for 400 EUR.
   tenant; there is no cost-centre or company-code partitioning of visibility.
 
 ### Known gaps in auth
-- **`GET /files/:name` is deliberately `@Public()`** and is now the weakest point in the
-  system. The extraction service fetches documents as an anonymous HTTP client, so a bearer
-  token cannot be required there; an unguessable UUID is all that protects a confidential
-  invoice PDF. The answer is **signed, expiring URLs** (or handing the extractor bytes over an
-  authenticated internal channel), not a token on this route.
+- ~~**`GET /files/:name` is protected only by an unguessable UUID.**~~ Fixed: every document
+  URL is now **signed and expiring** (`invoices/signed-url.ts`). The route stays `@Public()`
+  because the extraction service fetches as an anonymous client, but the *link* now carries the
+  authorisation — HMAC over `(filename, expiry)`, so a signature cannot be replayed against a
+  different document, a hand-edited expiry invalidates it, and a leaked link stops working.
+  Compared in constant time, because the endpoint is unauthenticated and an attacker gets
+  unlimited attempts. `FILE_URL_SIGNING_KEY` fails closed. Verified live: the old unsigned URL
+  now returns 404, a signed one returns the PDF, and replaying a signature onto another file,
+  extending the expiry, or dropping the signature all return 404.
+  Residual risk, stated plainly: within its TTL (15 min) a signed link is a bearer credential
+  for that one document. Shortening the TTL narrows the window; handing the extractor bytes
+  over an authenticated internal channel would remove it.
 - ~~**No role-based authorisation yet.**~~ Built — see "Role-based authorization" above.
   Recall/re-validate is now `AP_MANAGER`/`CONTROLLER` only.
 - **No refresh-token flow, no logout at the IdP.** Signing out clears the local token only.
@@ -810,12 +822,61 @@ build environment. What exists is built against the **real** OData specification
 at `src/erp/s4hana/spec/`: `API_SUPPLIERINVOICE_PROCESS_SRV` v1.5.0,
 `API_PURCHASEORDER_PROCESS_SRV` v1.0.0, `API_MATERIAL_DOCUMENT_SRV` v1.5.0.
 
-**All three mappers are pure functions with no caller.** They are tested against the specs and
-correct as far as a spec can make them, but nothing in `src/` invokes them: there is no HTTP
-client, no sync job, no credential plumbing, and `erpConnections` still has zero code
-references. The mapping is the part that needed a specification to get right; the transport is
-the part that needs a tenant. Read them as "the hard half is done and unverified against a live
-system", not as a working connector.
+**The transport now exists and runs** (`s4-client.ts`), so the mappers have a caller. What is
+still missing is a *tenant*: no request has ever gone to SAP. Everything below was verified
+against `mock-s4-server.ts`, a local OData V2 service that speaks the same wire protocol.
+
+- **Writes need a CSRF token, and the session cookie it came with.** SAP refuses any
+  POST/PUT/DELETE without an `x-csrf-token` fetched from a prior `X-CSRF-Token: Fetch` request
+  — *and* the cookies returned alongside it. A token replayed without its cookies fails exactly
+  like no token at all, which is the half that costs people an afternoon. Tokens also expire,
+  and the symptom is a 403 with `x-csrf-token: Required` on a request that worked a minute ago,
+  so the client retries **once** on that specific signal and no other. Bounded deliberately:
+  retrying a posting blindly is how duplicate accounting documents get created.
+- **A 404 is ambiguous** — "no such purchase order" or "no such service path". Treating the
+  second as the first turns a wrong base URL into "the ERP has no data", which reads as a
+  business problem and gets escalated to the wrong team. `S4NotFoundError` says so in the message.
+- **Query strings are built by hand.** `URLSearchParams` percent-encodes the `$` of every system
+  option into `%24top`. A conforming server decodes that identically, but every SAP example is
+  written against a literal `$`, and with no real tenant to test against, matching the documented
+  form is the safer reading.
+- **Timeouts are enforced with an AbortController** — a hung sync job is worse than a failed one.
+
+**Credentials are encrypted at rest** (`credential-crypto.ts`). `erpConnections.config` is a
+customer's keys to their own ERP: in plaintext, one `SELECT` by anyone with database access, a
+backup, or a slow-query log hands over the ability to post into a live ledger. AES-256-GCM
+rather than CBC, because GCM authenticates — a tampered ciphertext fails to decrypt instead of
+silently yielding *different* plaintext, and for a field that becomes a hostname that difference
+could redirect a posting at an attacker's endpoint. Encryption is **selective**: `baseUrl` and
+`companyCode` stay readable so a connection can be diagnosed; only `clientSecret`, `password`
+and `apiKey` are wrapped. Reads are redacted to `••••••••` — present-but-hidden, so "configured"
+and "not configured" do not look alike — and a redacted value written back means *leave it
+alone*, so a form-driven UI cannot blank a secret it never saw.
+
+**`ERP_CREDENTIALS_KEY` fails closed**, with no generate-on-boot fallback: a per-process key
+would make encryption appear to work while every restart orphaned the stored credentials.
+
+**Callable today, ADMIN-only:** `GET|POST /admin/erp-connections`, `PATCH /:id`,
+`POST /:id/test` (opens a real socket, stores the outcome on the row so "is this working"
+survives whoever clicked the button), and `POST /:id/sync/purchase-orders`. Sync goes through
+the same `PurchaseOrdersService.upsert` an administrator would call by hand, so a connector
+replay and a manual push cannot diverge into two code paths — verified idempotent.
+
+Verified live end to end: an admin created a connection, the API key came back redacted while
+the column held `v1.…` ciphertext, the connection test reached the mock over HTTP, and a sync
+pulled purchase order 4500000123 (EUR 1,200.00, one line) into Flowap's own `purchase_orders`
+table. Wrong credentials report *"Authentication failed: invalid API key"* rather than being
+swallowed.
+
+### Still missing before this touches a real SAP system
+- **No scheduled sync.** Manual trigger only. A cron wants a lock and a watermark so two
+  replicas do not both sweep; that belongs with the integration plane.
+- **No vendor master sync**, so a synced PO carries SAP's supplier *number* as its vendor name.
+  Correct matching needs `externalId` on vendors and a supplier pull.
+- **`postInvoice` is still not wired.** The supplier-invoice mapper and the CSRF-capable `post()`
+  both exist; nothing calls them, because posting into a live ledger is the one operation that
+  should not be switched on without a tenant to test against first.
+- **Goods receipts are not synced** either, though the mapper and the path are both ready.
 
 (Note: `CST_MaterialDocument` — SAP's Data Ingestion service — was ruled out deliberately. It
 is the wrong product and the wrong direction: it ingests *into* SAP's data platform rather than

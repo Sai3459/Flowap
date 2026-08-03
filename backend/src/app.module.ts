@@ -4,6 +4,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { DatabaseModule } from './db/database.module';
+import { ErpModule } from './erp/erp.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { WorkflowModule } from './workflow/workflow.module';
 import { VendorsModule } from './vendors/vendors.module';
@@ -20,6 +21,7 @@ import { InboundModule } from './inbound/inbound.module';
     DatabaseModule,
     AuthModule.forRoot(),
     AdminModule,
+    ErpModule,
     WorkflowModule,
     VendorsModule,
     InvoicesModule,

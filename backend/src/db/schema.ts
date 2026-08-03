@@ -437,9 +437,24 @@ export const inboundMessages = pgTable('inbound_messages', {
 export const erpConnections = pgTable('erp_connections', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
-  erpType: text('erp_type').notNull(),
+  erpType: text('erp_type').notNull(), // S4HANA_CLOUD
+  name: text('name'),
+  /**
+   * Connection settings, with the secret-bearing fields **encrypted at rest**.
+   *
+   * `baseUrl`, `companyCode` and the auth *kind* stay readable so an administrator can
+   * diagnose a connection; `clientSecret`, `password` and `apiKey` are AES-256-GCM envelopes
+   * (see `erp/credential-crypto.ts`). This column is a customer's keys to their own ERP — in
+   * plaintext, one SELECT by anyone with database access, a backup, or a slow-query log hands
+   * over the ability to post accounting documents into a live ledger.
+   */
   config: jsonb('config').notNull(),
   isActive: boolean('is_active').notNull().default(true),
+  /** Outcome of the last "test connection" or sync, so the state is visible without a log dive. */
+  lastTestedAt: timestamp('last_tested_at'),
+  lastTestOk: boolean('last_test_ok'),
+  lastTestMessage: text('last_test_message'),
+  lastSyncAt: timestamp('last_sync_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantIdx: index('erp_tenant_idx').on(t.tenantId),

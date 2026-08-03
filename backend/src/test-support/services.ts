@@ -11,6 +11,7 @@
  */
 import type { DatabaseService } from '../db/database.service';
 import { InvoicesService } from '../invoices/invoices.service';
+import { FileStorageService } from '../invoices/file-storage.service';
 import { WorkflowEngineService } from '../workflow/workflow-engine.service';
 import { VendorsService } from '../vendors/vendors.service';
 import { PurchaseOrdersService } from '../purchase-orders/purchase-orders.service';
@@ -43,6 +44,7 @@ export function buildServices(db: TestDb): TestServices {
     extraction as never, // structurally compatible: the pipeline only ever calls extract()
     workflow,
     vendors,
+    new FileStorageService(),
   );
   const purchaseOrders = new PurchaseOrdersService(database, vendors, invoices);
 

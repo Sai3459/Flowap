@@ -35,6 +35,11 @@ jobs:
       # The harness derives the test database by appending `_test`, and creates it if absent,
       # so nothing here has to pre-create it.
       DATABASE_URL: postgresql://postgres:devpass@localhost:5432/invoice_platform
+      # Both fail closed by design, so CI has to supply them or the suites cannot run. These
+      # are throwaway CI values and deliberately not secrets — nothing they protect exists on
+      # a runner. A real deployment reads them from a secret store.
+      FILE_URL_SIGNING_KEY: ci-only-file-signing-key-not-a-secret-000000
+      ERP_CREDENTIALS_KEY: ci-only-erp-credentials-key-not-a-secret-000
 
     steps:
       - uses: actions/checkout@v4

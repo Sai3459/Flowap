@@ -122,3 +122,33 @@ export function s4AuthFromEnv(): S4Auth | null {
   if (SAP_API_KEY) return new ApiKeyAuth(SAP_API_KEY);
   return null;
 }
+
+/**
+ * Builds an auth strategy from a stored connection config.
+ *
+ * Separate from `s4AuthFromEnv` because a per-tenant connection is the real case: env vars are
+ * a single-deployment convenience, whereas a multi-tenant install has one set of credentials
+ * per customer, held in `erpConnections`.
+ */
+export function resolveS4Auth(config: {
+  authKind: 'apiKey' | 'basic' | 'oauth2';
+  apiKey?: string;
+  user?: string;
+  password?: string;
+  tokenUrl?: string;
+  clientId?: string;
+  clientSecret?: string;
+}): S4Auth {
+  switch (config.authKind) {
+    case 'apiKey':
+      return new ApiKeyAuth(config.apiKey!);
+    case 'basic':
+      return new BasicAuth(config.user!, config.password!);
+    case 'oauth2':
+      return new OAuth2ClientCredentialsAuth(config.tokenUrl!, config.clientId!, config.clientSecret!);
+    default:
+      // Unreachable if the config was validated on write, but an unknown kind must never
+      // silently fall through to "no authentication".
+      throw new Error(`Unsupported S/4HANA auth kind: ${String((config as { authKind: string }).authKind)}`);
+  }
+}

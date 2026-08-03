@@ -13,6 +13,38 @@ verified failure points:
 See competitive research and full differentiation strategy in the conversation history /
 project docs — the short version is in "Core design decisions" below.
 
+## Branching and merges
+
+**Work happens on a feature branch; `main` is kept current by merging into it when a piece
+lands.** Do not let a branch run for weeks — the longer `main` lags, the less it means.
+
+Written down here on purpose. Sessions do not share memory: each one sees only its own
+conversation, so an instruction given in one session ("merge to main when a phase is done")
+is invisible to the next and gets silently dropped. Anything that must hold across sessions
+has to live in the repository, and this is the file every session is told to read first. At
+least two branches have existed in parallel on this repo (`claude/workflow-engine-setup-*`
+and `claude/invoice-list-screen`), which is exactly the situation where a convention nobody
+can see causes drift.
+
+**Merge when a coherent piece is finished** — a phase, a subsystem, a fix with its tests —
+not on a timer, and not mid-refactor.
+
+**Before merging, check CI is green on the *exact* commit being merged**, not on "a recent
+run". `.github/workflows/ci.yml` fires on every push; match the `head_sha` of the run against
+the branch head before trusting it. A green run two commits ago says nothing about this one.
+
+**Prefer a fast-forward.** If `main` is an ancestor of the branch there is no conflict to
+resolve and no merge commit worth making:
+```bash
+git fetch origin main
+git merge-base --is-ancestor origin/main <branch>   # exit 0 => fast-forward is safe
+git checkout main && git merge --ff-only <branch> && git push origin main
+```
+If `main` has diverged, merge it *into* the branch first, re-run the suites, and only then
+fast-forward — so conflicts are resolved and tested somewhere other than `main`.
+
+**Never force-push `main`.** The branch is disposable; `main` is not.
+
 ## Stack (chosen for THIS sandbox's constraints — re-evaluate for production)
 - **Backend:** NestJS (TypeScript), run via `ts-node` (NOT `tsx` — see gotcha below)
 - **ORM:** Drizzle ORM + `pg` (node-postgres) — NOT Prisma

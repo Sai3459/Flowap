@@ -28,6 +28,7 @@
     "class-validator": "^0.15.1",
     "drizzle-orm": "^0.45.2",
     "imapflow": "^1.6.5",
+    "jose": "^6.2.7",
     "mailparser": "^3.9.14",
     "multer": "^2.2.0",
     "pg": "^8.22.0",

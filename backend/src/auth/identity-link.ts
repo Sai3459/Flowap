@@ -27,7 +27,12 @@
  *    is picking someone's data at random. Multi-tenant users need explicit tenant selection;
  *    that is config-plane work.
  *
- * 5. **No just-in-time provisioning.** A perfectly valid token for someone with no Flowap
+ * 5. **A deactivated account is refused**, on both paths. Deactivation is how a leaver is
+ *    handled — the row survives because approval history points at it — so if it did not
+ *    block sign-in it would be decoration. Their IdP account may keep minting valid tokens
+ *    for months after they leave.
+ *
+ * 6. **No just-in-time provisioning.** A perfectly valid token for someone with no Flowap
  *    user is refused rather than granted an account. There is no safe default for the two
  *    fields that would have to be invented — which tenant, and which role — and inventing
  *    either means the corporate directory becomes the list of people who can approve
@@ -44,6 +49,7 @@ export interface LinkableUser {
   role: Role;
   ssoSubject: string | null;
   ssoIssuer: string | null;
+  isActive: boolean;
 }
 
 export interface TokenIdentity {
@@ -75,7 +81,13 @@ export function decideLink(
     // rows claiming one identity, and guessing between them is worse than refusing.
     return { kind: 'REJECT', reason: 'Multiple accounts share this SSO identity.' };
   }
-  if (bySubject.length === 1) return { kind: 'MATCHED', user: bySubject[0] };
+  if (bySubject.length === 1) {
+    // Deactivation has to bite here or it is cosmetic: the leaver's IdP account may still
+    // mint perfectly valid tokens long after they left, and the subject is already bound so
+    // every later request would sail through the happy path.
+    if (!bySubject[0].isActive) return { kind: 'REJECT', reason: 'This account is deactivated.' };
+    return { kind: 'MATCHED', user: bySubject[0] };
+  }
 
   if (!token.email) {
     return { kind: 'REJECT', reason: 'No account is linked to this SSO identity, and the token carries no email.' };
@@ -94,6 +106,9 @@ export function decideLink(
   }
 
   const user = candidates[0];
+  if (!user.isActive) {
+    return { kind: 'REJECT', reason: 'This account is deactivated.' };
+  }
   if (user.ssoSubject) {
     // Already claimed by a different IdP identity — see rule 3.
     return { kind: 'REJECT', reason: 'This account is already linked to a different SSO identity.' };

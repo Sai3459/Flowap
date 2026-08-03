@@ -18,6 +18,7 @@ import { FileStorageService } from './file-storage.service';
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
+import { Roles } from '../auth/roles.decorator';
 
 // Tenant is resolved from a header for the prototype. In production this comes from
 // the authenticated session (SSO claim), never a client-supplied header.
@@ -30,6 +31,7 @@ export class InvoicesController {
     private readonly fileStorage: FileStorageService,
   ) {}
 
+  @Roles('AP_CLERK', 'AP_MANAGER')
   @Post()
   ingest(@CurrentUser() { tenantId }: Principal, @Body() dto: IngestInvoiceDto) {
     return this.invoicesService.ingest(tenantId, dto);
@@ -40,6 +42,7 @@ export class InvoicesController {
    * pipeline as any other invoice, by URL — so an upload and a connector push take an
    * identical path, and there is no second code path to keep in step.
    */
+  @Roles('AP_CLERK', 'AP_MANAGER')
   @Post('upload')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }))
   async upload(
@@ -64,28 +67,36 @@ export class InvoicesController {
     );
   }
 
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN')
   @Get()
   list(@CurrentUser() { tenantId }: Principal) {
     return this.invoicesService.findAll(tenantId);
   }
 
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN')
   @Get('exceptions')
   exceptionQueue(@CurrentUser() { tenantId }: Principal) {
     return this.invoicesService.findExceptionQueue(tenantId);
   }
 
+  // APPROVER is included here and *only* here among the invoice reads: someone asked to
+  // approve a payment has to be able to see what they are approving. They still cannot list
+  // the tenant's invoices — and `findOne` restricts an APPROVER to invoices they hold or held
+  // a step on, which is a record-level rule the guard cannot express.
+  @Roles('AP_CLERK', 'APPROVER', 'AP_MANAGER', 'CONTROLLER', 'ADMIN')
   @Get(':id')
-  findOne(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
-    return this.invoicesService.findOne(tenantId, id);
+  findOne(@CurrentUser() user: Principal, @Param('id') id: string) {
+    return this.invoicesService.findOne(user.tenantId, id, user);
   }
 
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER')
   @Patch(':id/correct-field')
   correctField(
-    @CurrentUser() { tenantId }: Principal,
+    @CurrentUser() user: Principal,
     @Param('id') id: string,
     @Body() dto: CorrectFieldDto,
   ) {
-    return this.invoicesService.correctField(tenantId, id, dto);
+    return this.invoicesService.correctField(user.tenantId, id, dto, user);
   }
 
   /**
@@ -94,6 +105,7 @@ export class InvoicesController {
    * — notably releasing an invoice held by a low-confidence line item, which is why it forces
    * past the confidence gate.
    */
+  @Roles('AP_MANAGER', 'CONTROLLER')
   @Post(':id/revalidate')
   revalidate(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.invoicesService.revalidate(tenantId, id, { force: true });

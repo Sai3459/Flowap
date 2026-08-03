@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -9,6 +10,7 @@ import { and, desc, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import {
   approvalInstances,
+  approvalSteps,
   invoices,
   invoiceLineItems,
   invoiceExceptions,
@@ -27,6 +29,7 @@ import {
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { WorkflowEngineService } from '../workflow/workflow-engine.service';
 import { VendorsService } from '../vendors/vendors.service';
+import type { Principal } from '../auth/principal';
 
 /** Metadata for a document uploaded through the UI rather than posted in as a URL. */
 export interface StoredFile {
@@ -137,6 +140,29 @@ export function correctionBlockedByPosting(params: {
   invoiceStatus: string;
 }): boolean {
   return params.revalidates && (params.invoiceStatus === 'POSTED' || params.invoiceStatus === 'PAID');
+}
+
+/**
+ * Whether an AP_CLERK's correction is refused because it would recall a running approval.
+ *
+ * Pure and separately tested, because it is the one place where the role matrix was not
+ * expressive enough on its own. Correcting low-confidence extraction *is* the clerk's job, so
+ * the endpoint is open to them — but a correction to a check-feeding field now withdraws a
+ * live approval instance and **discards every approval already cast against the old figures**.
+ * A clerk should not be able to undo a controller's decision as a side effect of fixing a
+ * typo.
+ *
+ * So the split is by *state*, not by field: before an approval is running a clerk may correct
+ * anything; once one is running, the correction is a decision about withdrawing it, and that
+ * belongs to AP_MANAGER or CONTROLLER. Fields that feed no check (dates, reference, tax id)
+ * are never affected, because they never trigger a recall.
+ */
+export function correctionBlockedByRole(params: {
+  role: string;
+  revalidates: boolean;
+  hasActiveApproval: boolean;
+}): boolean {
+  return params.role === 'AP_CLERK' && params.revalidates && params.hasActiveApproval;
 }
 
 /** Names of fields sitting below the review threshold, read out of the fieldConfidence blob. */
@@ -754,7 +780,7 @@ export class InvoicesService {
     return blocked ? 'BLOCKED' : 'PROCEED';
   }
 
-  async correctField(tenantId: string, invoiceId: string, dto: CorrectFieldDto) {
+  async correctField(tenantId: string, invoiceId: string, dto: CorrectFieldDto, actor: Principal) {
     const [invoice] = await this.db
       .select()
       .from(invoices)
@@ -781,6 +807,23 @@ export class InvoicesService {
           `once the invoice is ${invoice.status} — the ERP already holds the accounting document. ` +
           'Raise a credit note or an ERP-side reversal instead.',
       );
+    }
+
+    // A clerk may fix extraction all day, but not by withdrawing a live approval — see
+    // correctionBlockedByRole. Checked here rather than in the guard because it depends on
+    // whether an instance is actually running, which only the record knows.
+    if (spec.revalidates) {
+      const [active] = await this.db
+        .select({ id: approvalInstances.id })
+        .from(approvalInstances)
+        .where(and(eq(approvalInstances.invoiceId, invoiceId), eq(approvalInstances.status, 'ACTIVE')));
+
+      if (correctionBlockedByRole({ role: actor.role, revalidates: true, hasActiveApproval: Boolean(active) })) {
+        throw new ForbiddenException(
+          `Changing "${dto.fieldName}" would withdraw the approval already running on this invoice ` +
+            'and discard the decisions cast against the old figures. Ask an AP_MANAGER or CONTROLLER.',
+        );
+      }
     }
 
     const value = spec.parse(dto.correctedValue);
@@ -886,7 +929,11 @@ export class InvoicesService {
     return withDetails;
   }
 
-  async findOne(tenantId: string, id: string) {
+  /**
+   * `actor` is optional so internal callers (re-validation, the pipeline) are unaffected; it is
+   * always supplied from the HTTP layer, where the record-level rule matters.
+   */
+  async findOne(tenantId: string, id: string, actor?: Principal) {
     // vendorName is joined in rather than left to the client: it carries a confidence score
     // in fieldConfidence, so a review UI needs the value next to it. It lives on the vendor
     // relation, not the invoice row.
@@ -896,6 +943,19 @@ export class InvoicesService {
       .leftJoin(vendors, eq(invoices.vendorId, vendors.id))
       .where(and(eq(invoices.id, id), eq(invoices.tenantId, tenantId)));
     if (!row) throw new NotFoundException('Invoice not found');
+
+    // An APPROVER can read an invoice only if they hold, or held, a step on it. They are
+    // frequently a line manager outside AP: being asked to approve one payment is not a reason
+    // to see the rest of the company's invoices. 404 rather than 403 here on purpose — a
+    // distinct 403 would confirm the invoice exists, which is the fact being withheld.
+    if (actor?.role === 'APPROVER') {
+      const [step] = await this.db
+        .select({ id: approvalSteps.id })
+        .from(approvalSteps)
+        .innerJoin(approvalInstances, eq(approvalSteps.instanceId, approvalInstances.id))
+        .where(and(eq(approvalInstances.invoiceId, id), eq(approvalSteps.approverId, actor.userId)));
+      if (!step) throw new NotFoundException('Invoice not found');
+    }
 
     const lineItems = await this.db
       .select()

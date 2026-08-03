@@ -6,6 +6,7 @@ import { ImapMailboxSource } from './imap-mailbox.source';
 import { MailboxService, type PollResult } from './mailbox.service';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
+import { Roles } from '../auth/roles.decorator';
 
 /**
  * Runs the inbound sweep on a schedule.
@@ -65,6 +66,7 @@ export class InboundController {
   constructor(private readonly mailbox: MailboxService) {}
 
   /** What has arrived by mail, and what was skipped and why. */
+  @Roles('AP_MANAGER', 'ADMIN')
   @Get('messages')
   messages(@CurrentUser() { tenantId }: Principal) {
     return this.mailbox.recent(tenantId);
@@ -74,6 +76,7 @@ export class InboundController {
    * Sweeps the mailbox now rather than waiting for the cron — for setup, for a support
    * request ("my invoice hasn't appeared"), and so the sweep is testable without a scheduler.
    */
+  @Roles('AP_MANAGER', 'ADMIN')
   @Post('poll')
   async poll(
     @CurrentUser() { tenantId }: Principal,

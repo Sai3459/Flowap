@@ -16,6 +16,7 @@ const user = (over: Partial<LinkableUser> = {}): LinkableUser => ({
   role: 'APPROVER',
   ssoSubject: null,
   ssoIssuer: null,
+  isActive: true,
   ...over,
 });
 
@@ -93,6 +94,27 @@ describe('first login — linking by email', () => {
     const d = decideLink(token(), [], [user({ id: 'a', tenantId: 't1' }), user({ id: 'b', tenantId: 't2' })]);
     assert.equal(d.kind, 'REJECT');
     assert.match(d.kind === 'REJECT' ? d.reason : '', /more than one tenant/i);
+  });
+});
+
+describe('deactivated accounts', () => {
+  it('REFUSES a deactivated user who is already linked', () => {
+    // The important direction. A leaver's IdP account can keep minting valid tokens for
+    // months, and their subject is already bound, so without this check every request would
+    // take the happy path straight through.
+    const linked = user({ ssoSubject: 'sub-alice', ssoIssuer: 'https://idp.test/', isActive: false });
+    const d = decideLink(token(), [linked], []);
+    assert.equal(d.kind, 'REJECT');
+    assert.match(d.kind === 'REJECT' ? d.reason : '', /deactivated/i);
+  });
+
+  it('REFUSES to link a deactivated user on first login', () => {
+    const d = decideLink(token(), [], [user({ isActive: false })]);
+    assert.equal(d.kind, 'REJECT');
+  });
+
+  it('still admits an active user', () => {
+    assert.equal(decideLink(token(), [], [user({ isActive: true })]).kind, 'BIND_SUBJECT');
   });
 });
 

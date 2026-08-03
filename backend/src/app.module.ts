@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
+import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { DatabaseModule } from './db/database.module';
 import { InvoicesModule } from './invoices/invoices.module';
@@ -18,6 +19,7 @@ import { InboundModule } from './inbound/inbound.module';
     ScheduleModule.forRoot(),
     DatabaseModule,
     AuthModule.forRoot(),
+    AdminModule,
     WorkflowModule,
     VendorsModule,
     InvoicesModule,

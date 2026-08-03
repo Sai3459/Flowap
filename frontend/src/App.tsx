@@ -14,6 +14,23 @@ import { PostingPage } from './pages/PostingPage';
 import { PurchaseOrdersPage } from './pages/PurchaseOrdersPage';
 import { UploadPage } from './pages/UploadPage';
 
+/**
+ * Which roles see which navigation, mirroring the backend permission matrix.
+ *
+ * A mirror is a maintenance risk — it can drift out of step with the server — so it is worth
+ * being clear about what it is for. The server enforces; this only decides what to *show*, so
+ * drift produces a visible 403 rather than unauthorised access. A UI role check is never a
+ * security boundary.
+ */
+const NAV_ROLES = {
+  overview: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'],
+  upload: ['AP_CLERK', 'AP_MANAGER'],
+  invoices: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'],
+  coding: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER'],
+  posting: ['AP_MANAGER', 'CONTROLLER'],
+  purchaseOrders: ['AP_CLERK', 'APPROVER', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'],
+} satisfies Record<string, readonly string[]>;
+
 /** Page titles, so the top bar names the app you are in rather than repeating the route. */
 const TITLES: [RegExp, string, string][] = [
   [/^\/$/, 'Overview', 'Everything across the workspace, as of now'],
@@ -132,6 +149,11 @@ export default function App() {
 
   const [, title, subtitle] = TITLES.find(([re]) => re.test(location.pathname)) ?? [null, 'Flowap', ''];
 
+  // Hides navigation a role cannot use. **This is not a security boundary** — the backend
+  // returns 403 regardless, and that is what actually enforces the matrix. This only avoids
+  // showing people doors that will not open for them.
+  const can = (area: keyof typeof NAV_ROLES) => (me ? NAV_ROLES[area].includes(me.role) : false);
+
   const counts = {
     review: summary?.byStatus
       .filter((s) => s.status === 'NEEDS_REVIEW' || s.status === 'EXCEPTION')
@@ -159,25 +181,36 @@ export default function App() {
         </div>
 
         <nav className="nav">
-          <NavLink to="/" end>Overview</NavLink>
+          {can('overview') && <NavLink to="/" end>Overview</NavLink>}
 
-          <div className="nav-group"><span className="lbl">Process</span></div>
-          <NavLink to="/upload">Upload</NavLink>
-          <NavLink to="/invoices">Invoices <span className="count">{counts.invoices}</span></NavLink>
-          <NavLink to="/review">Review queue <span className="count">{counts.review}</span></NavLink>
-          <NavLink to="/coding">Cost assignment</NavLink>
+          {(can('upload') || can('invoices') || can('coding')) && (
+            <div className="nav-group"><span className="lbl">Process</span></div>
+          )}
+          {can('upload') && <NavLink to="/upload">Upload</NavLink>}
+          {can('invoices') && <NavLink to="/invoices">Invoices <span className="count">{counts.invoices}</span></NavLink>}
+          {can('invoices') && <NavLink to="/review">Review queue <span className="count">{counts.review}</span></NavLink>}
+          {can('coding') && <NavLink to="/coding">Cost assignment</NavLink>}
 
+          {/* Everyone has a queue, including an ADMIN who will never have anything in it. */}
           <div className="nav-group"><span className="lbl">Approve</span></div>
           <NavLink to="/inbox">
             {waiting > 0 && <span className="beacon" />}
             My approvals <span className="count">{waiting}</span>
           </NavLink>
 
-          <div className="nav-group"><span className="lbl">Output</span></div>
-          <NavLink to="/posting">Posting <span className="count">{counts.posting}</span></NavLink>
+          {can('posting') && (
+            <>
+              <div className="nav-group"><span className="lbl">Output</span></div>
+              <NavLink to="/posting">Posting <span className="count">{counts.posting}</span></NavLink>
+            </>
+          )}
 
-          <div className="nav-group"><span className="lbl">Master data</span></div>
-          <NavLink to="/purchase-orders">Purchase orders</NavLink>
+          {can('purchaseOrders') && (
+            <>
+              <div className="nav-group"><span className="lbl">Master data</span></div>
+              <NavLink to="/purchase-orders">Purchase orders</NavLink>
+            </>
+          )}
         </nav>
 
         <IdentityPanel me={me} onSignOut={() => { session.clear(); setMe(null); setSignedIn(false); }} />

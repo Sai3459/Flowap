@@ -120,4 +120,5 @@ const SELECTION = {
   role: users.role,
   ssoSubject: users.ssoSubject,
   ssoIssuer: users.ssoIssuer,
+  isActive: users.isActive,
 };

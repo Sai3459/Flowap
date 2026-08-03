@@ -14,6 +14,7 @@
 import {
   CanActivate,
   ExecutionContext,
+  ForbiddenException,
   Injectable,
   Logger,
   UnauthorizedException,
@@ -21,8 +22,9 @@ import {
 import { Reflector } from '@nestjs/core';
 import { AuthService } from './auth.service';
 import { IS_PUBLIC } from './public.decorator';
+import { REQUIRED_ROLES } from './roles.decorator';
 import { bearerToken, TokenInvalidError, type createJwtVerifier } from './jwt-verifier';
-import type { Principal } from './principal';
+import type { Principal, Role } from './principal';
 
 /** Where the resolved principal lives on the request. Read it via `@CurrentUser()`. */
 export const PRINCIPAL_KEY = 'flowapPrincipal';
@@ -65,6 +67,23 @@ export class AuthGuard implements CanActivate {
     }
 
     request[PRINCIPAL_KEY] = principal;
+
+    // Authorization runs *after* authentication, in the same guard, so the ordering cannot be
+    // got wrong by registration order: there is no arrangement in which a role check runs
+    // against a principal that has not been established.
+    const required = this.reflector.getAllAndOverride<Role[]>(REQUIRED_ROLES, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (required?.length && !required.includes(principal.role)) {
+      // 403, not 404: the caller is authenticated and the route exists. Hiding that would
+      // make a permissions problem look like a bug to the person hitting it.
+      this.logger.warn(
+        `Denied ${principal.role} ${principal.email} at ${request.method} ${request.url}; needs one of ${required.join(', ')}.`,
+      );
+      throw new ForbiddenException(`This action requires one of: ${required.join(', ')}.`);
+    }
+
     return true;
   }
 }

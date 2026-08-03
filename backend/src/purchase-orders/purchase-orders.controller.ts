@@ -4,6 +4,7 @@ import { PurchaseOrdersService } from './purchase-orders.service';
 import { CreatePurchaseOrderDto, RecordReceiptDto } from './dto/purchase-order.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
+import { Roles } from '../auth/roles.decorator';
 
 @ApiTags('purchase-orders')
 @ApiBearerAuth()
@@ -12,6 +13,7 @@ export class PurchaseOrdersController {
   constructor(private readonly purchaseOrders: PurchaseOrdersService) {}
 
   /** Create or re-sync a PO. Idempotent on (tenant, poNumber). */
+  @Roles('AP_MANAGER', 'ADMIN')
   @Post()
   upsert(@CurrentUser() { tenantId }: Principal, @Body() dto: CreatePurchaseOrderDto) {
     return this.purchaseOrders.upsert(tenantId, dto);
@@ -28,6 +30,7 @@ export class PurchaseOrdersController {
   }
 
   /** Record goods-receipt quantities — the third leg of the three-way match. */
+  @Roles('AP_MANAGER', 'ADMIN')
   @Post(':poNumber/receipts')
   recordReceipt(
     @CurrentUser() { tenantId }: Principal,

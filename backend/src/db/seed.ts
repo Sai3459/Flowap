@@ -47,6 +47,14 @@ const SEED_USERS = [
   { email: 'manager1@acme.test', name: 'Manager One', role: 'AP_MANAGER' },
   { email: 'manager2@acme.test', name: 'Manager Two', role: 'AP_MANAGER' },
   { email: 'controller1@acme.test', name: 'Controller One', role: 'CONTROLLER' },
+  // The config-plane persona. Without one seeded, a fresh database has nobody who can edit
+  // workflow definitions, GL/cost-centre master or the user list — every one of those is
+  // ADMIN-only now. Deliberately cannot approve or post, so the separation of duties the role
+  // exists to create is visible from the first login rather than needing explanation.
+  { email: 'admin@acme.test', name: 'Admin One', role: 'ADMIN' },
+  // Purely an approver, to make the narrow role real in development: they can see the invoice
+  // they were asked to approve and nothing else.
+  { email: 'approver1@acme.test', name: 'Approver One', role: 'APPROVER' },
 ] as const;
 
 const SEED_GL_ACCOUNTS = [

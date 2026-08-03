@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import {
   CORRECTABLE_FIELDS,
   correctionBlockedByPosting,
+  correctionBlockedByRole,
   revalidationDecision,
 } from './invoices.service';
 
@@ -166,5 +167,36 @@ describe('CORRECTABLE_FIELDS — which corrections trigger a re-check', () => {
     // Spot-check the normalisations callers rely on.
     assert.equal(CORRECTABLE_FIELDS.currency.parse('usd'), 'USD');
     assert.equal(CORRECTABLE_FIELDS.poNumber.parse('  PO-9  '), 'PO-9');
+  });
+});
+
+/**
+ * The clerk correction gate.
+ *
+ * This is the one rule the endpoint-level matrix could not express, so it is worth being
+ * precise about what it protects: a correction to a check-feeding field withdraws a running
+ * approval and **discards every decision already cast against the old figures**. Fixing
+ * extraction is the clerk's job; undoing a controller's approval is not.
+ */
+describe('correctionBlockedByRole', () => {
+  const cases: [string, { role: string; revalidates: boolean; hasActiveApproval: boolean }, boolean][] = [
+    ['clerk, check-feeding field, approval running', { role: 'AP_CLERK', revalidates: true, hasActiveApproval: true }, true],
+    ['clerk, check-feeding field, nothing running', { role: 'AP_CLERK', revalidates: true, hasActiveApproval: false }, false],
+    ['clerk, harmless field, approval running', { role: 'AP_CLERK', revalidates: false, hasActiveApproval: true }, false],
+    ['manager, check-feeding field, approval running', { role: 'AP_MANAGER', revalidates: true, hasActiveApproval: true }, false],
+    ['controller, check-feeding field, approval running', { role: 'CONTROLLER', revalidates: true, hasActiveApproval: true }, false],
+  ];
+
+  for (const [name, params, expected] of cases) {
+    it(`${expected ? 'blocks' : 'allows'}: ${name}`, () => {
+      assert.equal(correctionBlockedByRole(params), expected);
+    });
+  }
+
+  it('gates on state rather than on the field list', () => {
+    // A clerk correcting `subtotal` on an invoice still in review is routine work and must not
+    // be refused — the block exists only because an approval is live.
+    assert.equal(correctionBlockedByRole({ role: 'AP_CLERK', revalidates: true, hasActiveApproval: false }), false);
+    assert.equal(correctionBlockedByRole({ role: 'AP_CLERK', revalidates: true, hasActiveApproval: true }), true);
   });
 });

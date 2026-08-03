@@ -99,6 +99,13 @@ export const users = pgTable('users', {
    */
   ssoSubject: text('sso_subject'),
   ssoIssuer: text('sso_issuer'),
+  /**
+   * Deactivation rather than deletion. `approvalSteps.approverId` and `invoices.postedById`
+   * reference this row, so removing a leaver would either break those FKs or destroy the
+   * record of who approved a payment. An inactive user is refused at sign-in, so the account
+   * stops working while the history it is attached to stays readable.
+   */
+  isActive: boolean('is_active').default(true).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantEmailUnique: unique().on(t.tenantId, t.email),

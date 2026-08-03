@@ -4,6 +4,7 @@ import { CodingService } from './coding.service';
 import { CodeLineDto, CreateCostCenterDto, CreateGlAccountDto } from './dto/coding.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
+import { Roles } from '../auth/roles.decorator';
 
 @ApiTags('cost-assignment')
 @ApiBearerAuth()
@@ -18,6 +19,7 @@ export class CodingController {
     return this.coding.listGlAccounts(tenantId);
   }
 
+  @Roles('ADMIN')
   @Post('gl-accounts')
   upsertGlAccount(@CurrentUser() { tenantId }: Principal, @Body() dto: CreateGlAccountDto) {
     return this.coding.upsertGlAccount(tenantId, dto);
@@ -28,6 +30,7 @@ export class CodingController {
     return this.coding.listCostCenters(tenantId);
   }
 
+  @Roles('ADMIN')
   @Post('cost-centers')
   upsertCostCenter(@CurrentUser() { tenantId }: Principal, @Body() dto: CreateCostCenterDto) {
     return this.coding.upsertCostCenter(tenantId, dto);
@@ -36,16 +39,19 @@ export class CodingController {
   // ---- the cost-assignment work itself ----
 
   /** The coding queue: invoices with at least one line still missing its assignment. */
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER')
   @Get('cost-assignment/queue')
   queue(@CurrentUser() { tenantId }: Principal) {
     return this.coding.findAwaitingCoding(tenantId);
   }
 
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER')
   @Get('invoices/:invoiceId/coding-suggestions')
   suggestions(@CurrentUser() { tenantId }: Principal, @Param('invoiceId') invoiceId: string) {
     return this.coding.suggestForInvoice(tenantId, invoiceId);
   }
 
+  @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER')
   @Patch('invoices/:invoiceId/lines/:lineId/code')
   codeLine(
     @CurrentUser() { tenantId }: Principal,

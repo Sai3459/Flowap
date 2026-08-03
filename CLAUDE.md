@@ -109,7 +109,8 @@ npm run dev        # http://localhost:5173
 ```
 
 **Sign in** at http://localhost:5173 with a seeded email — `alice@acme.test` (AP_CLERK),
-`manager1@acme.test` / `manager2@acme.test` (AP_MANAGER) or `controller1@acme.test`. The
+`manager1@acme.test` / `manager2@acme.test` (AP_MANAGER), `controller1@acme.test`,
+`approver1@acme.test` (APPROVER) or `admin@acme.test` (ADMIN — configures, cannot approve). The
 development issuer mints a real RS256 token for that address and the API verifies it through
 exactly the same path a production IdP's token takes. There is no tenant field and no
 "acting as" picker any more: tenant, user and role all come from the token's user row.
@@ -120,8 +121,8 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 257 unit tests — no DB, no server
-cd backend && npm run test:integration   # 76 integration tests — needs DATABASE_URL
+cd backend && npm test               # 266 unit tests — no DB, no server
+cd backend && npm run test:integration   # 96 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -137,8 +138,8 @@ database, so integration runs are pinned to `--test-concurrency=1`. Without it t
 truncate each other mid-run and everything fails at once.
 
 **CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 257 unit
-tests, 76 integration tests against a real `postgres:16-alpine` service container, 19 Python
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 266 unit
+tests, 96 integration tests against a real `postgres:16-alpine` service container, 19 Python
 tests, and the frontend build. So the suites are proven to pass on a clean machine from
 scratch, not just on a developer's warm one. (This entry previously said the workflow had never
 executed. That was true when written and stayed in the file long after it stopped being true —
@@ -618,15 +619,95 @@ The token is kept in `localStorage`, which is the pragmatic choice for a dev-iss
 **not** what a production build should do — an httpOnly cookie or in-memory token with silent
 refresh both survive XSS better.
 
+## Role-based authorization (the permission matrix)
+
+Roles were stored on `users` from day one and used by the workflow engine for `ROLE`-typed
+approver nodes, but **nothing ever checked them for access**. They do now.
+
+**Two different concepts, deliberately kept apart.** A *permission role* is what you may do;
+an *approval position* ("approver 1", "final approval") is where you sit in a chain. The
+second is not a role — it is a node in the workflow graph, and modelling it as a role is how
+AP systems end up with sixty roles nobody can audit. The five roles below are the whole set
+and no more should be added for approval levels.
+
+| Role | Does | Explicitly cannot |
+|---|---|---|
+| `AP_CLERK` | ingest, correct, code, read | approve, post, configure |
+| `APPROVER` | decide/delegate their own steps | list invoices, code, post, configure |
+| `AP_MANAGER` | everything a clerk does + approve, post, recall, ops | configure |
+| `CONTROLLER` | approve, post, recall, read everything | ingest, ops |
+| `ADMIN` | users, workflow definitions, GL/cost-centre master | **approve, post, ingest, code** |
+
+**`ADMIN` cannot transact, and that is the point of the role.** Whoever decides who may
+approve a payment must not also be able to approve one; a single account that could do both
+would make every other control here decorative. The cost is that a tenant needs at least two
+people.
+
+**`@Roles()` + a check inside `AuthGuard`.** In the same guard as authentication rather than a
+second one, so there is no registration order in which a role check could run against a
+principal that was never established. Absent `@Roles()` means "any authenticated user of the
+tenant", which is correct only for routes already scoped to the caller (`/auth/me`,
+`/approvals/inbox`).
+
+**Two rules the matrix could not express**, because they depend on the record rather than the
+route — both live in the service, where the record is in hand:
+- **An `APPROVER` may read only invoices they hold or held a step on.** They are frequently a
+  line manager outside AP; being asked to approve one payment is not a reason to see the
+  company's invoice book. Returns 404 rather than 403, because a distinct 403 would confirm
+  the invoice exists — which is the fact being withheld.
+- **An `AP_CLERK` may not correct a check-feeding field while an approval is running**
+  (`correctionBlockedByRole`). Correcting extraction is their job, but such a correction now
+  recalls the instance and **discards every approval already cast**; a clerk should not undo a
+  controller's decision as a side effect of fixing a typo. Gated on *state*, not on the field
+  list — before an approval starts, a clerk may correct anything.
+
+**User administration** — `GET|POST /admin/users`, `PATCH /admin/users/:id`, `ADMIN` only.
+No passwords (accounts are shells an OIDC identity binds to) and **no delete**, because
+`approvalSteps.approverId` and `invoices.postedById` reference the row: deleting a leaver
+would destroy the record of who approved a payment. Deactivation instead, via
+`users.isActive` (`drizzle/0004_user_deactivation.sql`).
+
+**Deactivation revokes immediately, including tokens already issued** — verified live. The
+user row is read on every request rather than trusted from the token, so an existing bearer
+token for a deactivated account returns 401 on its next call. Without the check in
+`decideLink` this would have been cosmetic: a leaver's IdP account can keep minting valid
+tokens for months, and their subject is already bound, so every request would take the happy
+path.
+
+Two lockout guards on `PATCH /admin/users/:id`: an admin cannot remove their own admin rights
+or deactivate themselves, and the **last** active admin cannot be demoted or disabled. Either
+would strand a tenant outside its own configuration with no route back in through the product.
+
+**The matrix is tested as data** (`rbac.int-spec.ts`): one row per route listing who may reach
+it, asserted in *both* directions against a running application. A matrix that only checks the
+allowed cases proves nothing — the interesting failure is a role reaching something it should
+not. Mutation-checked: disabling the guard's role check fails 19 tests.
+
+**The frontend hides navigation a role cannot use, and that is not a security boundary.** The
+server returns 403 regardless; the mirror in `App.tsx` only avoids showing people doors that
+will not open. Drift produces a visible 403, never unauthorised access.
+
+### Known gaps in authorization
+- **No Chart of Authority.** Approval *limits* are still expressed as CONDITION nodes on
+  amount inside the graph, so changing one person's spending authority means editing a
+  published workflow definition. A COA table (per-user limits by document type, company code,
+  cost centre, validity window) is the next piece; the agreed shape is enforcement-first —
+  check the decider's limit in `decideStep` — because that closes the delegation hole where a
+  manager hands a €40k invoice to a junior with a €5k limit.
+- **`POST /purchase-orders` is `AP_MANAGER`/`ADMIN` as an interim.** It is shaped for an ERP
+  connector to replay idempotently, so it really wants a **service identity**, which does not
+  exist yet.
+- **No per-record scoping beyond the two rules above.** A clerk can see every invoice in the
+  tenant; there is no cost-centre or company-code partitioning of visibility.
+
 ### Known gaps in auth
 - **`GET /files/:name` is deliberately `@Public()`** and is now the weakest point in the
   system. The extraction service fetches documents as an anonymous HTTP client, so a bearer
   token cannot be required there; an unguessable UUID is all that protects a confidential
   invoice PDF. The answer is **signed, expiring URLs** (or handing the extractor bytes over an
   authenticated internal channel), not a token on this route.
-- **No role-based authorisation yet.** Every authenticated user of a tenant can reach every
-  endpoint of that tenant. Recall/re-validate in particular is still ungated — previously
-  blocked on identity, which now exists, so this is unblocked rather than blocked.
+- ~~**No role-based authorisation yet.**~~ Built — see "Role-based authorization" above.
+  Recall/re-validate is now `AP_MANAGER`/`CONTROLLER` only.
 - **No refresh-token flow, no logout at the IdP.** Signing out clears the local token only.
 - **One issuer per deployment.** `resolveAuthConfig` reads a single `OIDC_ISSUER`. Per-tenant
   issuers — which real multi-tenant SaaS needs — would key the verifier by tenant. The schema

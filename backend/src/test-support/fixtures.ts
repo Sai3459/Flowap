@@ -160,13 +160,20 @@ export const SCENARIOS = {
     lines: [{ description: 'Widget A', quantity: 10, unitPrice: 50, lineTotal: 500.0, confidence: 0.95 }],
   }),
   /**
-   * REAL DOCUMENT — Arena Media Comunicaciones España, S.A. (Havas Media Network) billing
+   * REAL DOCUMENT — Arena Media Comunications España, S.A. (Havas Media Network) billing
    * PUMA ITALIA SRL. Invoice 2026001293, dated 04/05/2026, due 03/06/2026.
    *
-   * Provenance, stated plainly: these values were transcribed by hand from the supplied PDF.
-   * They did **not** come out of the extraction service — no `ANTHROPIC_API_KEY` has ever been
-   * available here, so the vision path remains unrun. What this fixture proves is that the
-   * *pipeline* handles a real document's shape; it proves nothing about extraction accuracy.
+   * Provenance: transcribed by hand from the supplied PDF, then **checked against a real
+   * extraction run** once an API key became available. That run corrected one value here —
+   * `vendorName` was transcribed as "Comunicaciones", the Spanish spelling, which appears
+   * nowhere on the document. The letterhead reads "ARENA MEDIA COMUNICATIONS ESPAÑA, S.A."
+   * and the footer "Arena Media Communications España S.A.". The model read the letterhead
+   * correctly and the human did not.
+   *
+   * (Note those two printed spellings differ by one `m`, so they normalise to *different*
+   * vendor keys. `resolveVendor` only ever sees the letterhead, so this is latent rather than
+   * live — but a supplier whose own footer disagrees with its letterhead is exactly the
+   * fragmentation `normaliseVendorName` exists to contain, and it cannot fix this case.)
    *
    * What makes it worth keeping:
    *   - Amounts printed `10.000,00` — European grouping. The old money parser rejected this.
@@ -175,9 +182,13 @@ export const SCENARIOS = {
    *     so tax is genuinely zero rather than missing.
    *   - No purchase order. "BUDGET: 536478", "REQUEST Nº: 11/26" and the line's "Order
    *     23080608" are all decoys an extractor may be tempted to report as a PO.
+   *     **The live run took the bait**, returning the BUDGET number as `poNumber` — at 0.75
+   *     confidence, so the gate caught it and the invoice went to review rather than matching
+   *     against a purchase order that does not exist. The decoy this comment predicted is
+   *     real, and the confidence threshold is what contains it.
    */
   arenamedia: invoice({
-    number: '2026001293', vendor: 'Arena Media Comunicaciones España, S.A.',
+    number: '2026001293', vendor: 'Arena Media Comunications España, S.A.',
     po: null, reference: '17294',
     invoiceDate: '2026-05-04', dueDate: '2026-06-03', supplyDate: null,
     vendorTaxId: 'A80537327', currency: 'EUR',

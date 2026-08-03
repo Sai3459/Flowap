@@ -96,7 +96,7 @@ still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints 
 ```bash
 cd backend && npm test               # 216 unit tests — no DB, no server
 cd backend && npm run test:integration   # 53 integration tests — needs DATABASE_URL
-cd extraction-service && .venv/bin/python -m pytest -q   # 13 tests
+cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
 
@@ -165,7 +165,7 @@ matching `ts-node src/main.ts` before restarting.
    This entry previously claimed the check was unit-tested. It was not — it had been verified
    interactively in an earlier session and never committed as a test, so nothing in the repo
    would have caught a regression in the single most important piece of logic in the
-   extraction service. `extraction-service/test_consistency.py` now covers it (13 tests):
+   extraction service. `extraction-service/test_consistency.py` now covers it (19 tests):
    both checks, the rounding tolerance boundary, `min()` never *raising* an already-low
    confidence, and unparseable/missing amounts leaving the pass inert rather than crashing
    ingestion.
@@ -179,12 +179,12 @@ matching `ts-node src/main.ts` before restarting.
    out of road. The engine that evaluates this at runtime is **built** — see
    `src/workflow/` and the graph contract below.
 
-4. **Every table is tenant-scoped from day one** (`tenantId` FK on nearly everything).
+3. **Every table is tenant-scoped from day one** (`tenantId` FK on nearly everything).
    Tenant resolution is currently a raw `x-tenant-id` header for prototype convenience —
    **this must be replaced with SSO-session-derived tenant resolution before any real
    auth is added.** Never let a client supply its own tenant ID in production.
 
-5. **ERP integration is an overlay, not a replacement.** `ErpConnection` stores
+4. **ERP integration is an overlay, not a replacement.** `ErpConnection` stores
    per-tenant connector config; the platform should feel like an upgrade sitting on top
    of the existing ERP, not a new system of record competing with it.
 
@@ -343,7 +343,7 @@ node — there's a regression test for exactly that.
     the scenario names or invoice numbers drift, and also asserts every fixture is
     arithmetically self-consistent except the one that must not be. Verified the guard bites
     by breaking a number and watching it fail.
-  - **`extraction-service/test_consistency.py`** — 13 tests for the arithmetic pass, which had
+  - **`extraction-service/test_consistency.py`** — 19 tests for the arithmetic pass, which had
     none (see design decision 2).
   - **`.github/workflows/ci.yml`**, **`docker-compose.yml`** and three Dockerfiles — written,
     never executed. See the warnings in "How to run locally".
@@ -645,44 +645,65 @@ Deliberately excluded: microservices, and any customer-authored scripting/plugin
 Configuration-as-data plus a good connector interface covers the real cases without handing
 customers a way to break their own tenant.
 
+## Extraction has now actually run (the former #1 gap)
+
+An `ANTHROPIC_API_KEY` was supplied and `main.py` made its first real vision calls, against
+the two genuine invoices. **Measured accuracy: 26/26 fields correct across both documents.**
+
+What the run found, in order of how much it matters:
+
+- **The service returned 502 on every real document.** The model presents its JSON inside a
+  ```json fence — that is simply how it renders code — and `json.loads` on a fenced string
+  raises at character 0. So the *entire* real extraction path was broken, and 269 passing
+  tests said nothing, because `mock_server.py` never fenced its canned replies. The bug lived
+  in the one seam no test crossed. `strip_code_fence()` fixes it, with 6 regression tests
+  including one asserting that genuinely malformed JSON still fails loudly rather than being
+  silently "repaired" into plausible-looking values.
+- **The confidence gate earned its keep.** On the Arena Media invoice the model reported
+  `poNumber: "536478"` — which is the **BUDGET** number, not a purchase order. The fixture
+  comment had predicted exactly this decoy. It came back at **0.75**, below the 0.9 threshold,
+  so the invoice went to `NEEDS_REVIEW` instead of matching against a PO that does not exist.
+  Design decision 1 is no longer a theory. Note the failure was *stable* across repeated runs,
+  so this is a systematic misread of that layout, not sampling noise — retrying would not
+  help, and only the threshold contains it.
+- **The model beat the human on a field.** `vendorName` was transcribed by hand as
+  "Comunicaciones", the Spanish spelling, which appears **nowhere** on the document — the
+  letterhead reads "COMUNICATIONS". The fixtures have been corrected. Worth remembering when
+  reading any remaining hand-transcribed value: the answer key had an error in it.
+- **Self-assessed confidence tracked reality.** Ready4people prints Spain's three VAT rates as
+  a fixed template with the charged column blank; the model returned tax `0.0` at confidence
+  **0.6** rather than reading 21% off the template. It was both right and appropriately unsure
+  — which is the behaviour the whole per-field confidence design assumes but had never been
+  able to verify.
+
+Still open on extraction: two documents is not a corpus, both are Spanish/European non-PO
+invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate document. The
+`/feedback` loop remains a stub.
+
 ## Not yet built (in rough priority order)
-1. **One real extraction run — still the top gap, but now half-closed.**
-   Two genuine invoices have been through the system (Arena Media Comunicaciones España S.A.
-   and Ready4people Development S.L., both billing PUMA ITALIA SRL). What that proved:
-   - The real PDFs upload, store and serve back **byte-identical** (md5 verified), and the
-     extraction service can fetch one and base64 it — the exact payload `main.py` would send.
-   - The pipeline handles them: non-PO path, 0% reverse-charge VAT, accented vendor names,
-     European amounts and dates, through approval, coding and posting to ERP doc 5117487728.
-   - `src/test-support/fixtures.ts` now carries both as permanent scenarios, and
-     `real-documents.int-spec.ts` runs them on every CI run.
-   What it did **not** prove, and this is the part that remains open: the field values were
-   **transcribed by hand from the PDFs**, not produced by the extraction service. There is
-   still no `ANTHROPIC_API_KEY` here, so the vision call has never executed and extraction
-   accuracy is still entirely unmeasured. Give the service a key and re-run these two
-   documents — the fixtures are the answer key to compare against.
-2. **Real auth** — *now also the gate on the whole config plane, see above.*
+1. **Real auth** — *now also the gate on the whole config plane, see above.*
    SSO (Entra ID, Google), replace the `x-tenant-id` header hack **and** the
    workspace's "acting as" picker. This is also what makes the approver check real:
    `decideStep`/`delegateStep` verify the caller is the step's assigned approver, but against a
    **client-supplied** `approverId`. That stops wrong-user and accidental decisions; it is not
    authorization until the id comes from a session. `assertIsAssignedApprover` then reads the
    session subject — the check itself doesn't move. Same for `postedById`.
-3. **A real ERP connector.** Posting is simulated: the document number is generated locally.
+2. **A real ERP connector.** Posting is simulated: the document number is generated locally.
    `erpConnections` still stores config with no connector logic. Nothing pulls purchase orders,
    GL accounts, cost centres or vendors from an ERP either — all four are pushed in by hand.
-4. **Notifying the next approver, outside the app.** In-app arrival is now covered — the
+3. **Notifying the next approver, outside the app.** In-app arrival is now covered — the
    workspace polls the acting user's queue and announces new items (see "Feedback effects").
    But that only reaches someone with the tab open: there is still no email, no push, no
    digest, and no server-side notification of any kind. The poll is also per-open-tab, which
    is fine for a prototype and is not how this should work at volume; the eventual answer is
    the server emitting an event when a step is created.
-5. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
-6. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
+4. **Fraud risk scoring** — `Vendor.riskScore` field exists; nothing populates it.
+5. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
    frequency counts over this vendor's history, not a model call), plain-language explanations
    of why an invoice is stuck (`_consistency_warnings` is a natural input).
-7. **Feedback loop** — `/feedback` on the extraction service is a stub; corrections should
+6. **Feedback loop** — `/feedback` on the extraction service is a stub; corrections should
    persist per tenant/vendor-layout and feed back into the prompt as few-shot examples.
-8. **Vendor portal** — separate, simplified auth context and shell.
+7. **Vendor portal** — separate, simplified auth context and shell.
 
 ### Known gaps in the workflow engine
 - **The SLA scheduler is a single-process in-memory cron, with no locking.** Fine for one
@@ -786,12 +807,14 @@ customers a way to break their own tenant.
   "Acme Inc." and "Acme, Inc" become two vendors — and duplicate detection, which keys on
   `vendorId`, won't see invoices from those two as related.
 
-### Inbound is still one endpoint
-`POST /invoices` with a `fileUrl` is the only way in. `sourceChannel` accepts EMAIL/PORTAL/
-MOBILE/etc. but it is **just a label the caller passes** — there is no mailbox listener, no
-vendor portal, no upload screen. The extraction service does fetch the URL and base64 it for
-Claude vision (`main.py`), so the real path is coded, but it has only ever been exercised
-against `mock_server.py`: no real PDF and no real `ANTHROPIC_API_KEY` has been through it.
+### Inbound: three channels, one pipeline
+`POST /invoices` with a `fileUrl` remains the single ingestion path, and that is the point —
+the upload screen, the IMAP poller and any future connector all resolve to it, so there is no
+second code path to keep in step. Real PDFs and real vision calls have both now been through
+it end to end.
+
+What is still missing is a **vendor portal** (suppliers submitting directly), and
+`sourceChannel` remains a label the caller passes rather than something the server derives.
 
 ## Conventions
 - Tenant ID always comes first in service method signatures: `(tenantId, ...)`.

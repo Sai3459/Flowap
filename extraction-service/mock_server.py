@@ -132,13 +132,13 @@ def scenarios() -> dict:
             subtotal=450.00, tax=36.00, total=486.00,
             lines=[line("Paper reams", 30, 15, 450.00)],
         ),
-        # REAL DOCUMENT — Arena Media Comunicaciones España, S.A. billing PUMA ITALIA SRL.
+        # REAL DOCUMENT — Arena Media Comunications España, S.A. billing PUMA ITALIA SRL.
         # Transcribed by hand from the supplied PDF; NOT produced by the extraction service,
         # which has still never run against a real document. Amounts print as 10.000,00 and
         # dates as 04/05/2026 (day-first); VAT is genuinely 0 (intra-EU reverse charge), and
         # BUDGET/REQUEST/Order numbers on the page are PO decoys.
         "arenamedia": invoice(
-            number="2026001293", vendor="Arena Media Comunicaciones España, S.A.",
+            number="2026001293", vendor="Arena Media Comunications España, S.A.",
             po=None, reference="17294",
             invoice_date="2026-05-04", due_date="2026-06-03", supply_date=None,
             vendor_tax_id="A80537327", currency="EUR",

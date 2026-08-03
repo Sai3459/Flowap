@@ -95,6 +95,34 @@ class FeedbackRequest(BaseModel):
     corrected_value: str
 
 
+def strip_code_fence(text: str) -> str:
+    """
+    Unwraps a ```json ... ``` fence around the model's reply.
+
+    Asking for "only JSON" gets JSON, but a vision-capable model routinely presents it as a
+    fenced code block anyway — that is how it has learned to render code. `json.loads` on the
+    fenced string raises at character 0, so before this the service returned 502 on **every
+    real document**. The mock never fenced its canned replies, which is precisely why 269
+    passing tests said nothing about it: the bug lived in the one seam no test crossed.
+
+    Deliberately tolerant rather than clever — it takes what is between the first and last
+    brace when a fence is present, so a stray prose sentence before or after the block is
+    survivable too. It never *rewrites* the JSON, so a genuinely malformed reply still fails
+    loudly instead of being silently repaired into something plausible.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    # Drop the opening fence line (``` or ```json) and any closing fence.
+    body = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[: -len("```")]
+
+    start, end = body.find("{"), body.rfind("}")
+    return body[start : end + 1] if start != -1 and end > start else body.strip()
+
+
 def _field(value, confidence: float) -> dict:
     return {"value": value, "confidence": round(confidence, 3)}
 
@@ -192,7 +220,7 @@ async def _call_claude_vision(file_base64: str, media_type: str) -> dict:
     raw_text = "".join(text_blocks).strip()
 
     try:
-        return json.loads(raw_text)
+        return json.loads(strip_code_fence(raw_text))
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=502,

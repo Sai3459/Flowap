@@ -9,6 +9,7 @@ session and never committed as a test, so nothing would have caught a regression
 Run:  .venv/bin/python -m pytest test_consistency.py -q
 """
 import copy
+import json
 
 import pytest
 
@@ -129,3 +130,43 @@ def test_line_item_missing_line_total_does_not_raise():
 
     # The KeyError is swallowed, so the line-item check simply does not run.
     assert result["subtotal"]["confidence"] == 0.95
+
+
+# ---------------------------------------------------------------------------
+# Code-fence stripping.
+#
+# Regression tests for a bug that only a real model call could reveal: the service
+# returned 502 on every genuine document because the reply arrived fenced.
+# ---------------------------------------------------------------------------
+from main import strip_code_fence
+
+
+def test_unfenced_json_passes_through():
+    assert json.loads(strip_code_fence('{"a": 1}')) == {"a": 1}
+
+
+def test_strips_a_json_fence():
+    # The exact shape that broke the first real extraction.
+    fenced = '```json\n{\n  "invoiceNumber": {"value": "2026001293", "confidence": 0.99}\n}\n```'
+    assert json.loads(strip_code_fence(fenced))["invoiceNumber"]["value"] == "2026001293"
+
+
+def test_strips_a_bare_fence():
+    assert json.loads(strip_code_fence('```\n{"a": 1}\n```')) == {"a": 1}
+
+
+def test_survives_prose_around_the_block():
+    fenced = '```json\nHere is the extraction:\n{"a": 1}\nLet me know if you need more.\n```'
+    assert json.loads(strip_code_fence(fenced)) == {"a": 1}
+
+
+def test_does_not_repair_malformed_json():
+    # A genuinely broken reply must still fail loudly. Silently "fixing" extraction output
+    # would put invented values into an accounting pipeline.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(strip_code_fence('```json\n{"a": }\n```'))
+
+
+def test_handles_nested_braces_and_trailing_newlines():
+    fenced = '```json\n{"outer": {"inner": [1, 2]}}\n\n```\n'
+    assert json.loads(strip_code_fence(fenced)) == {"outer": {"inner": [1, 2]}}

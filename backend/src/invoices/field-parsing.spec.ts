@@ -4,7 +4,7 @@
  * Both documents are Spanish suppliers billing an Italian customer, and both broke the
  * original parsers:
  *
- *   Arena Media Comunicaciones España, S.A. — invoice 2026001293, 04/05/2026,
+ *   Arena Media Comunications España, S.A. — invoice 2026001293, 04/05/2026,
  *     due 03/06/2026, EUR 10.000,00, 0% VAT (intra-EU reverse charge)
  *   Ready4people Development, S.L. — factura 260011, 23/01/2026, due 22/02/2026,
  *     EUR 800,00, VAT rate table printed (21/10/4) but nothing charged

@@ -5,7 +5,7 @@
  * use US number and date conventions, so the parsers passed their tests and would have
  * corrupted the first real European invoice they saw. These two are genuine:
  *
- *   Arena Media Comunicaciones España, S.A. → PUMA ITALIA SRL, EUR 10.000,00, 0% VAT
+ *   Arena Media Comunications España, S.A. → PUMA ITALIA SRL, EUR 10.000,00, 0% VAT
  *   Ready4people Development, S.L.          → PUMA ITALIA SRL, EUR 800,00,    0% VAT
  *
  * **What this does and does not prove.** The field values come from `fixtures.ts`, where they
@@ -116,7 +116,7 @@ describe('real supplied invoices (integration)', { skip: skipReason() }, () => {
 
     const rows = await db.select().from(vendors).where(eq(vendors.tenantId, tenantId));
     const names = rows.map((v) => v.name);
-    assert.ok(names.includes('Arena Media Comunicaciones España, S.A.'), names.join(' | '));
+    assert.ok(names.includes('Arena Media Comunications España, S.A.'), names.join(' | '));
     assert.ok(names.includes('Ready4people Development, S.L.'));
   });
 
@@ -125,7 +125,7 @@ describe('real supplied invoices (integration)', { skip: skipReason() }, () => {
     // once: every previous fixture was pure ASCII.
     const inv = await ingest('arenamedia');
     const full = await svc.invoices.findOne(tenantId, inv.id);
-    assert.equal(full.vendorName, 'Arena Media Comunicaciones España, S.A.');
+    assert.equal(full.vendorName, 'Arena Media Comunications España, S.A.');
   });
 
   it('keeps the line item exactly as billed', async () => {

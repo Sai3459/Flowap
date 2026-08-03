@@ -1,26 +1,28 @@
-import { Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
-import { ApiHeader, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { WorkflowEngineService } from './workflow-engine.service';
 import { CreateWorkflowDefinitionDto, DecideStepDto, DelegateStepDto } from './dto/workflow.dto';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { Principal } from '../auth/principal';
 
 @ApiTags('workflow-definitions')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller('workflow-definitions')
 export class WorkflowDefinitionsController {
   constructor(private readonly workflowEngine: WorkflowEngineService) {}
 
   @Post()
-  create(@Headers('x-tenant-id') tenantId: string, @Body() dto: CreateWorkflowDefinitionDto) {
+  create(@CurrentUser() { tenantId }: Principal, @Body() dto: CreateWorkflowDefinitionDto) {
     return this.workflowEngine.createDefinition(tenantId, dto);
   }
 
   @Get()
-  list(@Headers('x-tenant-id') tenantId: string) {
+  list(@CurrentUser() { tenantId }: Principal) {
     return this.workflowEngine.listDefinitions(tenantId);
   }
 
   @Get(':id')
-  getOne(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+  getOne(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.workflowEngine.getDefinition(tenantId, id);
   }
 
@@ -31,72 +33,81 @@ export class WorkflowDefinitionsController {
    * instance keep running the graph it started under.
    */
   @Post(':id/publish')
-  publish(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+  publish(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.workflowEngine.publishDefinition(tenantId, id);
   }
 
   /** Takes a definition out of service without replacing it — new invoices go unrouted. */
   @Post(':id/retire')
-  retire(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+  retire(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.workflowEngine.retireDefinition(tenantId, id);
   }
 }
 
 @ApiTags('approvals')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller('approvals')
 export class ApprovalsController {
   constructor(private readonly workflowEngine: WorkflowEngineService) {}
 
   // Declared before ':invoiceId' so the literal path isn't swallowed by the param route.
   @Get('overdue')
-  overdue(@Headers('x-tenant-id') tenantId: string) {
+  overdue(@CurrentUser() { tenantId }: Principal) {
     return this.workflowEngine.findOverdueSteps(tenantId);
   }
 
-  /** One approver's work queue — what is waiting on them right now. */
-  @Get('inbox/:approverId')
-  inbox(@Headers('x-tenant-id') tenantId: string, @Param('approverId') approverId: string) {
-    return this.workflowEngine.findPendingForApprover(tenantId, approverId);
+  /**
+   * The caller's own work queue.
+   *
+   * The approver id used to be a path parameter, which meant any authenticated user could
+   * read any colleague's queue by changing it — a plain IDOR, and one that leaks which
+   * invoices are in flight and who is sitting on them. It is the session now, so the route
+   * takes no id and there is nothing to enumerate.
+   */
+  @Get('inbox')
+  inbox(@CurrentUser() { tenantId, userId }: Principal) {
+    return this.workflowEngine.findPendingForApprover(tenantId, userId);
   }
 
-  /** One approver's decision history — what they have already approved, rejected or delegated. */
-  @Get('history/:approverId')
-  history(@Headers('x-tenant-id') tenantId: string, @Param('approverId') approverId: string) {
-    return this.workflowEngine.findHistoryForApprover(tenantId, approverId);
+  /** The caller's own decision history. Session-scoped for the same reason as the inbox. */
+  @Get('history')
+  history(@CurrentUser() { tenantId, userId }: Principal) {
+    return this.workflowEngine.findHistoryForApprover(tenantId, userId);
   }
 
   /** How many approvals an invoice has had and how many it still needs. */
   @Get(':invoiceId/progress')
-  progress(@Headers('x-tenant-id') tenantId: string, @Param('invoiceId') invoiceId: string) {
+  progress(@CurrentUser() { tenantId }: Principal, @Param('invoiceId') invoiceId: string) {
     return this.workflowEngine.getApprovalProgress(tenantId, invoiceId);
   }
 
   @Post('escalate-overdue')
-  escalateOverdue(@Headers('x-tenant-id') tenantId: string) {
+  escalateOverdue(@CurrentUser() { tenantId }: Principal) {
     return this.workflowEngine.escalateOverdueSteps(tenantId);
   }
 
   @Get(':invoiceId')
-  getInstance(@Headers('x-tenant-id') tenantId: string, @Param('invoiceId') invoiceId: string) {
+  getInstance(@CurrentUser() { tenantId }: Principal, @Param('invoiceId') invoiceId: string) {
     return this.workflowEngine.getInstance(tenantId, invoiceId);
   }
 
   @Post('steps/:stepId/decide')
   decideStep(
-    @Headers('x-tenant-id') tenantId: string,
+    @CurrentUser() { tenantId, userId }: Principal,
     @Param('stepId') stepId: string,
     @Body() dto: DecideStepDto,
   ) {
-    return this.workflowEngine.decideStep(tenantId, stepId, dto);
+    // The actor is the session, never the body. This is the line that turns the existing
+    // assigned-approver check from a politeness into authorization.
+    return this.workflowEngine.decideStep(tenantId, stepId, { ...dto, approverId: userId });
   }
 
   @Post('steps/:stepId/delegate')
   delegateStep(
-    @Headers('x-tenant-id') tenantId: string,
+    @CurrentUser() { tenantId, userId }: Principal,
     @Param('stepId') stepId: string,
     @Body() dto: DelegateStepDto,
   ) {
-    return this.workflowEngine.delegateStep(tenantId, stepId, dto);
+    return this.workflowEngine.delegateStep(tenantId, stepId, { ...dto, fromApproverId: userId });
   }
 }

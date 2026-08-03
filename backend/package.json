@@ -37,6 +37,7 @@
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.1.28",
     "@types/express": "^5.0.6",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^26.1.2",

@@ -1,9 +1,11 @@
-import { Controller, Get, Headers, Injectable, Module } from '@nestjs/common';
-import { ApiHeader, ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Injectable, Module } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { and, eq } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { users, vendors } from '../db/schema';
 import { normaliseVendorName } from './vendor-name';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { Principal } from '../auth/principal';
 
 /**
  * Shared vendor resolution. Both invoice ingestion and purchase-order sync need to turn a
@@ -73,18 +75,18 @@ export class VendorsService {
 }
 
 @ApiTags('directory')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller()
 export class DirectoryController {
   constructor(private readonly vendorsService: VendorsService) {}
 
   @Get('vendors')
-  vendors(@Headers('x-tenant-id') tenantId: string) {
+  vendors(@CurrentUser() { tenantId }: Principal) {
     return this.vendorsService.list(tenantId);
   }
 
   @Get('users')
-  users(@Headers('x-tenant-id') tenantId: string) {
+  users(@CurrentUser() { tenantId }: Principal) {
     return this.vendorsService.listUsers(tenantId);
   }
 }

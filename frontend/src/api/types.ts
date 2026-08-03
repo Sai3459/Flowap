@@ -235,3 +235,14 @@ export interface InboundMessage {
   outcome: { accepted: number; skipped: { filename: string; reason: string }[] } | null;
   processedAt: string;
 }
+
+/** What `GET /auth/me` returns — the server's answer to "who am I", replacing the picker. */
+export interface CurrentUser {
+  userId: string;
+  tenantId: string;
+  email: string;
+  name: string;
+  role: string;
+  subject: string;
+  issuer: string;
+}

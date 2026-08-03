@@ -1,38 +1,34 @@
-import { Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
-import { ApiHeader, ApiTags } from '@nestjs/swagger';
-import { IsOptional, IsUUID } from 'class-validator';
+import { Controller, Get, Param, Post } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { PostingService } from './posting.service';
-
-export class PostInvoiceDto {
-  /** Who posted it. Client-supplied until SSO lands, same caveat as approver ids. */
-  @IsOptional()
-  @IsUUID()
-  postedById?: string;
-}
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { Principal } from '../auth/principal';
 
 @ApiTags('posting')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller()
 export class PostingController {
   constructor(private readonly posting: PostingService) {}
 
   /** Approved invoices with nothing left but posting. */
   @Get('posting/ready')
-  ready(@Headers('x-tenant-id') tenantId: string) {
+  ready(@CurrentUser() { tenantId }: Principal) {
     return this.posting.findReadyToPost(tenantId);
   }
 
   @Get('posting/posted')
-  posted(@Headers('x-tenant-id') tenantId: string) {
+  posted(@CurrentUser() { tenantId }: Principal) {
     return this.posting.findPosted(tenantId);
   }
 
+  /**
+   * Posting records who did it, and that is now the session rather than a body field.
+   * `postedById` is the audit trail for an irreversible action — the ERP holds the accounting
+   * document afterwards — so a caller naming someone else as the poster was the last place a
+   * client could write a false actor into the record.
+   */
   @Post('invoices/:id/post')
-  post(
-    @Headers('x-tenant-id') tenantId: string,
-    @Param('id') id: string,
-    @Body() dto: PostInvoiceDto,
-  ) {
-    return this.posting.post(tenantId, id, dto.postedById);
+  post(@CurrentUser() { tenantId, userId }: Principal, @Param('id') id: string) {
+    return this.posting.post(tenantId, id, userId);
   }
 }

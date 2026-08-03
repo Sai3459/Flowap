@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Route, Routes, useLocation } from 'react-router-dom';
 import { api, session } from './api/client';
-import type { TenantUser } from './api/types';
+import type { CurrentUser } from './api/types';
 import { useApi } from './lib/useApi';
 import { useInboxWatch } from './lib/useInboxWatch';
 import { DashboardPage } from './pages/DashboardPage';
@@ -28,63 +28,107 @@ const TITLES: [RegExp, string, string][] = [
 ];
 
 /**
- * Identity is chosen, not authenticated. The tenant header and the "acting as" picker both
- * stand in for a login the backend does not have yet — see CLAUDE.md. Everything downstream
- * reads `session`, so when SSO arrives this panel is deleted and nothing else changes.
+ * Who you are, as the server sees it. Read-only.
+ *
+ * This replaces the tenant field and the "acting as" picker. Both were client-supplied
+ * identity — one asserted a tenant, the other chose whose approvals you could cast — and both
+ * are gone because neither could be made safe. There is nothing to change here now: tenant,
+ * name and role all come from `GET /auth/me`, which reads them off the token's user row.
  */
-function IdentityPanel({
-  users,
-  user,
-  setUser,
-}: {
-  users: TenantUser[];
-  user: string;
-  setUser: (id: string) => void;
-}) {
-  const [tenant, setTenant] = useState(session.tenantId());
-
-  // Default to the first approver so the inbox is not empty on a fresh load. This lives in
-  // App's state rather than the panel's because the queue watcher needs the same value.
-  useEffect(() => {
-    if (!user && users.length > 0) {
-      const preferred = users.find((u) => u.role !== 'AP_CLERK') ?? users[0];
-      session.setUserId(preferred.id);
-      setUser(preferred.id);
-    }
-  }, [users, user, setUser]);
-
+function IdentityPanel({ me, onSignOut }: { me: CurrentUser | null; onSignOut: () => void }) {
+  if (!me) return null;
   return (
     <div className="identity">
-      <span className="lbl">Acting as</span>
-      <select
-        value={user}
-        onChange={(e) => { session.setUserId(e.target.value); setUser(e.target.value); window.location.reload(); }}
-      >
-        {users.length === 0 && <option value="">no users</option>}
-        {users.map((u) => (
-          <option key={u.id} value={u.id}>{u.name} · {u.role}</option>
-        ))}
-      </select>
-      <span className="lbl" style={{ marginTop: '0.3rem' }}>Tenant</span>
-      <input
-        value={tenant}
-        placeholder="tenant UUID"
-        onChange={(e) => setTenant(e.target.value)}
-        onBlur={() => { if (tenant.trim() !== session.tenantId()) { session.setTenantId(tenant); window.location.reload(); } }}
-      />
+      <span className="lbl">Signed in as</span>
+      <span className="mono" style={{ fontSize: '0.78rem' }}>{me.name}</span>
+      <span className="lbl" style={{ marginTop: '0.3rem' }}>Role</span>
+      <span className="mono" style={{ fontSize: '0.78rem' }}>{me.role}</span>
+      <button className="ghost" style={{ marginTop: '0.5rem' }} onClick={onSignOut}>Sign out</button>
+    </div>
+  );
+}
+
+/**
+ * Development sign-in against the local OIDC issuer.
+ *
+ * It asks the dev issuer for a token by email and stores it — the same Authorization header a
+ * real IdP's token would produce, verified by the same code path. A production build replaces
+ * this with a redirect to the real authorization endpoint; nothing downstream changes,
+ * because everything downstream only knows there is a bearer token.
+ */
+function SignIn({ onSignedIn }: { onSignedIn: () => void }) {
+  const [email, setEmail] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!email.trim()) return;
+    setBusy(true);
+    setError('');
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'}/dev-auth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      if (!res.ok) throw new Error(`Token endpoint returned ${res.status}`);
+      const { access_token } = (await res.json()) as { access_token: string };
+      session.setToken(access_token);
+      onSignedIn();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="page">
+      <div className="notice">
+        <strong>Sign in</strong>
+        <div style={{ marginTop: '0.5rem', opacity: 0.8 }}>
+          Development issuer. A token is minted for the email you give, then verified exactly as a
+          real identity provider's would be — the account must already exist in Flowap.
+        </div>
+        <div style={{ marginTop: '0.7rem', display: 'flex', gap: '0.5rem' }}>
+          <input
+            placeholder="alice@acme.test"
+            style={{ width: '20rem' }}
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+          />
+          <button className="primary" disabled={busy} onClick={() => void submit()}>
+            {busy ? 'Signing in…' : 'Sign in'}
+          </button>
+        </div>
+        {error && <div className="err" style={{ marginTop: '0.6rem' }}>{error}</div>}
+      </div>
     </div>
   );
 }
 
 export default function App() {
   const location = useLocation();
-  const tenantId = session.tenantId();
-  const { data: users } = useApi<TenantUser[]>(() => api.listUsers(), []);
-  const { data: summary } = useApi(() => api.dashboard(), [location.pathname]);
-  const [actingUser, setActingUser] = useState(session.userId());
+  const [signedIn, setSignedIn] = useState(session.isSignedIn());
+  const [me, setMe] = useState<CurrentUser | null>(null);
+  const [authError, setAuthError] = useState('');
 
-  // Announces invoices arriving in the acting user's queue from anywhere in the workspace.
-  const { waiting } = useInboxWatch(actingUser);
+  // Who the server says we are. A 401 here means the token is stale or the account was
+  // removed — either way the only correct response is to stop pretending to be signed in.
+  useEffect(() => {
+    if (!signedIn) return;
+    api.me().then(setMe, (e: Error) => {
+      session.clear();
+      setSignedIn(false);
+      setAuthError(e.message);
+    });
+  }, [signedIn]);
+
+  const { data: summary } = useApi(() => (signedIn && me ? api.dashboard() : Promise.resolve(null)), [location.pathname, me]);
+
+  // Announces invoices arriving in this user's queue from anywhere in the workspace.
+  const { waiting } = useInboxWatch(me?.userId ?? '');
 
   const [, title, subtitle] = TITLES.find(([re]) => re.test(location.pathname)) ?? [null, 'Flowap', ''];
 
@@ -96,20 +140,12 @@ export default function App() {
     invoices: summary?.totals.invoices ?? 0,
   };
 
-  if (!tenantId) {
+  if (!signedIn) {
     return (
-      <div className="page">
-        <div className="notice">
-          Set a tenant UUID to begin — find one with <code className="mono">psql -c "SELECT id, name FROM tenants;"</code>
-          <div style={{ marginTop: '0.7rem' }}>
-            <input
-              placeholder="tenant UUID"
-              style={{ width: '24rem' }}
-              onBlur={(e) => { if (e.target.value.trim()) { session.setTenantId(e.target.value); window.location.reload(); } }}
-            />
-          </div>
-        </div>
-      </div>
+      <>
+        {authError && <div className="page"><div className="notice err">{authError}</div></div>}
+        <SignIn onSignedIn={() => { setAuthError(''); setSignedIn(true); }} />
+      </>
     );
   }
 
@@ -144,7 +180,7 @@ export default function App() {
           <NavLink to="/purchase-orders">Purchase orders</NavLink>
         </nav>
 
-        <IdentityPanel users={users ?? []} user={actingUser} setUser={setActingUser} />
+        <IdentityPanel me={me} onSignOut={() => { session.clear(); setMe(null); setSignedIn(false); }} />
       </aside>
 
       <div className="main">

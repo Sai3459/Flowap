@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, session } from '../api/client';
+import { api } from '../api/client';
 import type { InvoiceListItem, ReadyToPostItem } from '../api/types';
 import { useApi } from '../lib/useApi';
 import { Empty, ErrorNote, Loading, Money } from '../components/ui';
@@ -26,7 +26,7 @@ export function PostingPage() {
     setError(null);
     setFlash(null);
     try {
-      const result = await api.postInvoice(invoiceId, session.userId() || undefined);
+      const result = await api.postInvoice(invoiceId);
       setFlash(`${label} posted as ERP document ${result.erpDocumentNumber}.`);
       lift({
         title: 'Posted to the ERP',

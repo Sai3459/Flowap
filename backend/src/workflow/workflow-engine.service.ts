@@ -19,7 +19,7 @@ import {
 } from '../db/schema';
 import { isApproveEdge, WorkflowEdge, WorkflowGraph, WorkflowNode } from './workflow-graph.types';
 import { validateGraph } from './workflow-graph.validator';
-import { CreateWorkflowDefinitionDto, DecideStepDto, DelegateStepDto } from './dto/workflow.dto';
+import { CreateWorkflowDefinitionDto, DecideStepInput, DelegateStepInput } from './dto/workflow.dto';
 
 type ApprovalInstanceRow = typeof approvalInstances.$inferSelect;
 type ApprovalStepRow = typeof approvalSteps.$inferSelect;
@@ -346,7 +346,7 @@ export class WorkflowEngineService {
    * advances past the node — down the approve edge, or the reject edge if the node
    * as a whole was rejected (falling back to terminating the instance if there is none).
    */
-  async decideStep(tenantId: string, stepId: string, dto: DecideStepDto) {
+  async decideStep(tenantId: string, stepId: string, dto: DecideStepInput) {
     const { step, instance, graph, node } = await this.loadPendingStep(tenantId, stepId);
     this.assertIsAssignedApprover(step, dto.approverId);
 
@@ -402,7 +402,7 @@ export class WorkflowEngineService {
    * the same node for the delegate, inheriting the original's SLA deadline so
    * delegating can't be used to quietly reset the clock.
    */
-  async delegateStep(tenantId: string, stepId: string, dto: DelegateStepDto) {
+  async delegateStep(tenantId: string, stepId: string, dto: DelegateStepInput) {
     const { step, instance, node } = await this.loadPendingStep(tenantId, stepId);
     this.assertIsAssignedApprover(step, dto.fromApproverId);
 

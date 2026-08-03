@@ -2,20 +2,31 @@ import { Controller, Get, Param, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import { ApiTags } from '@nestjs/swagger';
 import { FileStorageService } from './file-storage.service';
+import { Public } from '../auth/public.decorator';
 
 /**
  * Serves stored documents back over HTTP.
  *
- * Deliberately not tenant-scoped by a header: the extraction service fetches these URLs as an
- * anonymous client, and filenames are unguessable UUIDs. That is fine for a prototype and
- * **not** fine for production — real deployments want signed, expiring URLs, because an
- * invoice PDF is confidential.
+ * **This is the one authenticated-API route that is deliberately `@Public()`**, and it is the
+ * weakest point in the system now that everything else requires a token. The extraction
+ * service fetches these URLs as an anonymous HTTP client — it is a separate Python process
+ * with no Flowap session — so requiring a bearer token here would break ingestion.
+ *
+ * What protects a document today is only that its filename is an unguessable UUID. That is
+ * adequate for a prototype and **not** adequate for production: an invoice PDF is
+ * confidential, and a URL that never expires and needs no credential will end up in a log, a
+ * proxy, or a browser history.
+ *
+ * The fix is not to put a token on this route — it is to stop passing raw URLs at all:
+ * **signed, expiring URLs** (or handing the extractor bytes over an authenticated internal
+ * channel). Tracked as a known gap; see CLAUDE.md.
  */
 @ApiTags('files')
 @Controller('files')
 export class FilesController {
   constructor(private readonly fileStorage: FileStorageService) {}
 
+  @Public()
   @Get(':storedFilename')
   serve(@Param('storedFilename') storedFilename: string, @Res() res: Response) {
     // Content-Type matters here: this endpoint exists so the extraction service can fetch the

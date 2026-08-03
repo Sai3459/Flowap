@@ -83,7 +83,9 @@ npx drizzle-kit push --force   # applies schema — see src/db/schema.ts
 # rename. A fresh database needs neither.
 #   psql "$DATABASE_URL" -f drizzle/0001_supersede_model.sql
 npm run db:seed                # tenants, users, GL/cost centres, PO-5000, workflow definitions
-npx ts-node src/main.ts        # NOT npx tsx
+# Authentication is required and fails closed: with neither OIDC_ISSUER nor AUTH_DEV_ISSUER
+# the process refuses to start rather than serving an unauthenticated API.
+AUTH_DEV_ISSUER=true npx ts-node src/main.ts        # NOT npx tsx
 
 # 3. Extraction service (separate terminal)
 cd extraction-service
@@ -106,15 +108,20 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-The UI needs a tenant UUID, entered in its header bar and kept in localStorage (the backend
-still resolves tenants from the `x-tenant-id` header). `npm run db:seed` prints it — or set
-`VITE_TENANT_ID` in `frontend/.env` as a default (see `frontend/.env.example`).
+**Sign in** at http://localhost:5173 with a seeded email — `alice@acme.test` (AP_CLERK),
+`manager1@acme.test` / `manager2@acme.test` (AP_MANAGER) or `controller1@acme.test`. The
+development issuer mints a real RS256 token for that address and the API verifies it through
+exactly the same path a production IdP's token takes. There is no tenant field and no
+"acting as" picker any more: tenant, user and role all come from the token's user row.
+
+An account must already exist — a valid token for an unknown email is refused, deliberately
+(see "no just-in-time provisioning" below).
 
 ## Tests
 
 ```bash
-cd backend && npm test               # 246 unit tests — no DB, no server
-cd backend && npm run test:integration   # 66 integration tests — needs DATABASE_URL
+cd backend && npm test               # 257 unit tests — no DB, no server
+cd backend && npm run test:integration   # 76 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm run build         # typecheck + build; there are no frontend tests
 ```
@@ -130,8 +137,8 @@ database, so integration runs are pinned to `--test-concurrency=1`. Without it t
 truncate each other mid-run and everything fails at once.
 
 **CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 246 unit
-tests, 66 integration tests against a real `postgres:16-alpine` service container, 19 Python
+most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 257 unit
+tests, 76 integration tests against a real `postgres:16-alpine` service container, 19 Python
 tests, and the frontend build. So the suites are proven to pass on a clean machine from
 scratch, not just on a developer's warm one. (This entry previously said the workflow had never
 executed. That was true when written and stayed in the file long after it stopped being true —
@@ -207,10 +214,10 @@ matching `ts-node src/main.ts` before restarting.
    out of road. The engine that evaluates this at runtime is **built** — see
    `src/workflow/` and the graph contract below.
 
-3. **Every table is tenant-scoped from day one** (`tenantId` FK on nearly everything).
-   Tenant resolution is currently a raw `x-tenant-id` header for prototype convenience —
-   **this must be replaced with SSO-session-derived tenant resolution before any real
-   auth is added.** Never let a client supply its own tenant ID in production.
+3. **Every table is tenant-scoped from day one** (`tenantId` FK on nearly everything), and
+   **the tenant is derived from the authenticated user's row, never from the request.** This
+   used to be an `x-tenant-id` header; that is gone. A client cannot name a tenant, a user or
+   a role anywhere in the API surface. See "Authentication" below.
 
 4. **ERP integration is an overlay, not a replacement.** `ErpConnection` stores
    per-tenant connector config; the platform should feel like an upgrade sitting on top
@@ -548,6 +555,86 @@ node — there's a regression test for exactly that.
     card just appears. Verified by scrubbing the animation in a real browser: at 250ms it is
     at scale 0.74 / z −162 / opacity 0.55, settled by 1700ms, gone by 2600ms.
 
+## Authentication (Phase 1 — complete)
+
+**`x-tenant-id` is gone.** There is no header, no query parameter and no body field by which a
+caller can name a tenant, a user or a role. Every request carries an OIDC bearer token; the
+guard verifies it, resolves it to a `users` row, and everything downstream reads tenant and
+actor from that row. Verified live: the exact request that used to return a tenant's invoices
+— `curl -H "x-tenant-id: <uuid>" /invoices` — now returns **401**, and a *valid* token
+presented with a forged `x-tenant-id` for another tenant returns that caller's own data,
+not the named tenant's.
+
+**Deny by default.** `AuthGuard` is an `APP_GUARD`, so it covers every route including ones
+added later. Forgetting to annotate a new endpoint leaves it **closed**; opening one requires
+writing `@Public()` deliberately. That direction is the whole point — the previous arrangement
+failed open and an unprotected endpoint looked identical to a protected one.
+
+**Fails closed at startup, twice.** With neither `OIDC_ISSUER` nor `AUTH_DEV_ISSUER` the
+process refuses to boot rather than serving an unauthenticated API; and `AUTH_DEV_ISSUER=true`
+with `NODE_ENV=production` throws during construction, because the dev issuer mints valid
+tokens for any email on request. Both verified by running them.
+
+### The pieces
+- **`jwt-verifier.ts`** — JWKS signature check, issuer *and* audience required, asymmetric-only
+  algorithm pin, bounded clock skew, `email_verified` read strictly.
+- **`identity-link.ts`** — the decision table (subject is the identity key; email links only on
+  first login and only when verified; never re-link a claimed account; ambiguous email across
+  tenants refused; **no just-in-time provisioning**).
+- **`auth.service.ts`** — lookup and first-login binding, with `WHERE sso_subject IS NULL` so a
+  concurrent second binding is refused rather than overwriting the first.
+- **`auth.guard.ts` + `@CurrentUser()`** — the guard, and the decorator that replaced 39
+  `@Headers('x-tenant-id')` parameters. `@CurrentUser()` **throws** rather than yielding
+  undefined on a `@Public()` route, because the quiet form of that mistake is `tenantId`
+  becoming undefined and a query then matching every tenant's rows.
+- **`dev-issuer.ts`** — a real local OIDC issuer (discovery document, JWKS, RS256 signing), so
+  development exercises the *same* verification path as production. Deliberately **not** a
+  bypass branch in the guard: a `if (dev) skipAuth()` leaves the real path untested until the
+  first IdP is connected, which is the worst moment to find out it is wrong.
+
+### The actor now comes from the session
+`decideStep`, `delegateStep` and `post` used to take the actor from the request body, so the
+"is this the assigned approver?" check compared a value the caller chose against one the caller
+could look up. It stopped mistakes, not people. Now:
+- `DecideStepDto` has **no** `approverId` field at all, and `forbidNonWhitelisted` rejects a
+  request that still sends one — verified: **400**, not silently ignored.
+- Approving someone else's step returns **403**, verified live with two real tokens.
+- `DelegateStepDto` carries only the recipient. A handoff you can perform on someone else's
+  behalf is not a handoff.
+- `GET /approvals/inbox/:approverId` **was an IDOR** — any authenticated user could read any
+  colleague's queue by changing the id. The routes are now `/approvals/inbox` and
+  `/approvals/history`, session-scoped, with no id to enumerate.
+- `postedById` is the session, closing the last place a client could write a false actor into
+  an irreversible record.
+
+### Frontend
+The tenant field and the "acting as" role picker are **deleted**, not hidden — both were
+client-asserted identity. The shell shows "Signed in as / Role" read from `GET /auth/me`, plus
+sign-out. Verified in a real browser: sign in as `manager1@acme.test` → dashboard renders with
+role `AP_MANAGER` from the server, zero tenant inputs, zero selects, sign-out returns to the
+sign-in screen, no console errors.
+
+The token is kept in `localStorage`, which is the pragmatic choice for a dev-issuer flow and
+**not** what a production build should do — an httpOnly cookie or in-memory token with silent
+refresh both survive XSS better.
+
+### Known gaps in auth
+- **`GET /files/:name` is deliberately `@Public()`** and is now the weakest point in the
+  system. The extraction service fetches documents as an anonymous HTTP client, so a bearer
+  token cannot be required there; an unguessable UUID is all that protects a confidential
+  invoice PDF. The answer is **signed, expiring URLs** (or handing the extractor bytes over an
+  authenticated internal channel), not a token on this route.
+- **No role-based authorisation yet.** Every authenticated user of a tenant can reach every
+  endpoint of that tenant. Recall/re-validate in particular is still ungated — previously
+  blocked on identity, which now exists, so this is unblocked rather than blocked.
+- **No refresh-token flow, no logout at the IdP.** Signing out clears the local token only.
+- **One issuer per deployment.** `resolveAuthConfig` reads a single `OIDC_ISSUER`. Per-tenant
+  issuers — which real multi-tenant SaaS needs — would key the verifier by tenant. The schema
+  is ready for it (`users.ssoIssuer` is stored and matched), the wiring is not.
+- **`@nestjs/testing` is now a dev dependency.** The repo previously avoided it on the grounds
+  that plain classes need no test framework, which was right for services; booting an HTTP app
+  with a global guard is the case it earns.
+
 ## ERP connector (S/4HANA Cloud Public Edition)
 
 `src/erp/` — the connector contract plus the S/4HANA implementation. **Nothing has ever
@@ -662,19 +749,20 @@ The system has four planes, and until Phase 0 it had exactly one.
    would expose a customer's ERP password), scheduled sync jobs, idempotent replay, retry with
    a dead-letter queue, and outbound events. **Not built** — `erpConnections` is still a table
    with zero code references.
-4. **Developer plane** — CI, seeds, fixtures, local stack, test harness. **This is Phase 0,
-   and it is what just landed.**
+4. **Developer plane** — CI, seeds, fixtures, local stack, test harness. **Built (Phase 0).**
 
 **Backend stays one modular monolith.** Different apps in the UI does not mean different
 services in the backend; splitting now buys distributed transactions and pays nothing. The
 extraction service stays separate because it is Python and scales on a different curve.
 
-**Hard dependency:** the config plane cannot ship before real auth. Anyone can currently send
-any `x-tenant-id`; adding rule-editing on top of that lets anyone rewrite anyone's approval
-routing, i.e. approve their own invoices. Auth is a prerequisite for Phase 1, not an item
-beside it.
+**Hard dependency, now satisfied:** the config plane could not ship before real auth, because
+rule-editing on top of a client-supplied tenant header would have let anyone rewrite anyone's
+approval routing — i.e. approve their own invoices. Authentication landed, so the config plane
+is unblocked. Note it needs one thing auth does not yet provide: **role-based authorisation**.
+Today every authenticated user of a tenant can reach every endpoint of that tenant, which is
+survivable for transactional screens and is not survivable for rule editing.
 
-Phase order: **0 developer plane (done)** → 1 auth + config plane → 2 integration framework
+Phase order: **0 developer plane (done)** → **1 auth (done) + config plane** → 2 integration framework
 with one real connector → 3 per-tenant sandbox and workflow simulation ("run these 200
 invoices through the draft graph and show me where they land"), which is both a test tool and
 the safe way to change a live workflow.
@@ -719,42 +807,8 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 `/feedback` loop remains a stub.
 
 ## Not yet built (in rough priority order)
-1. **Real auth — Phase 1, now underway. 2 of 5 steps landed, and NOTHING IS WIRED YET.**
-   Until step 3, `x-tenant-id` is still exactly how tenants resolve: any caller can send any
-   tenant id and read that tenant's invoices. Do not read the presence of `src/auth/` as
-   meaning the API is protected.
-
-   Landed, both isolated from `app.module.ts`:
-   - **`jwt-verifier.ts`** — verifies an OIDC access token against the issuer's JWKS.
-     Asymmetric-only algorithm pin, issuer *and* audience both required, bounded clock skew.
-     Scope note established by mutation-testing rather than assumed: while the key source is a
-     JWKS, `jose` already refuses `alg: none` and refuses to resolve a symmetric key from a key
-     set, so the algorithm pin changes nothing *today* — it is defence-in-depth for a non-JWKS
-     key source, and there is a test using one that fails without it. The audience check, by
-     contrast, was load-bearing immediately.
-   - **`identity-link.ts` + `auth.service.ts`** — which Flowap user a verified token is. The
-     subject is the identity key, not the email; email may be used to *find* a user only on
-     first login and only when the IdP asserts `email_verified`; a user already bound to a
-     different subject is never re-linked; an email matching users in more than one tenant is
-     refused as ambiguous; and there is **no just-in-time provisioning** — a valid token for
-     someone with no Flowap user is refused, because the alternative makes the corporate
-     directory the list of people who can approve payments.
-   - **Schema:** `users.ssoIssuer` beside `ssoSubject`, plus
-     `UNIQUE (sso_issuer, sso_subject)`. Both columns, because `sub` is unique only *within*
-     an issuer — two IdPs can each emit `sub: "12345"`, and keying on the subject alone lets
-     one identity collide onto another's row, which across tenants is a cross-tenant breach.
-     Applied by `drizzle/0003_sso_identity.sql`, hand-written because `push` offers to
-     **truncate `users`** rather than add a constraint to a populated table.
-   - **Role never comes from the token.** An IdP group claim describes the corporate
-     directory; it does not decide who may approve a payment here. Tested: a token asserting
-     `role: ADMIN` yields the row's `APPROVER`.
-
-   Still to do: **3.** the global deny-by-default guard and `@CurrentUser()`, which is the
-   commit that actually removes `x-tenant-id` from all 40 endpoints · **4.** the approver
-   check reading the session instead of a client-supplied `approverId` (today it stops
-   wrong-user and accidental decisions, and is not authorization; same for `postedById`) ·
-   **5.** a local OIDC dev issuer, so development exercises the same verification path as
-   production rather than a bypass branch.
+1. ~~**Real auth**~~ — **DONE. Phase 1 complete; `x-tenant-id` no longer exists.**
+   Moved out of this list; see "Authentication" below.
 2. **A real ERP connector.** Posting is simulated: the document number is generated locally.
    `erpConnections` still stores config with no connector logic. Nothing pulls purchase orders,
    GL accounts, cost centres or vendors from an ERP either — all four are pushed in by hand.
@@ -804,9 +858,9 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 - **No PO is ever closed or cancelled.** There is no status on `purchaseOrders`, so a fully
   consumed or cancelled order still matches new invoices exactly as an open one does.
 - **Recall is not gated by a role.** `POST /invoices/:id/revalidate` and any correction that
-  triggers one will recall an in-flight approval for whoever calls it. Restricting that to
-  AP_MANAGER/CONTROLLER is meaningless until identity comes from a session rather than a
-  client-supplied id — it lands with Phase 1 auth.
+  triggers one will recall an in-flight approval for whoever calls it. This was blocked on
+  identity; identity now exists, so restricting it to AP_MANAGER/CONTROLLER is **unblocked and
+  simply not written yet** — there is no role-based authorisation anywhere in the API.
 - **Re-validation is not transactional.** It clears the match state, resolves exceptions, then
   re-runs validation as separate statements; a crash midway leaves the invoice with its old
   exceptions resolved and no new match.
@@ -829,10 +883,11 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
   visible on the detail screen. An "open exceptions" view independent of status is missing.
 
 ### Known gaps in upload, coding and posting
-- **Uploaded files are served unauthenticated.** `GET /files/:name` takes no tenant header,
-  because the extraction service fetches it as an anonymous client. Names are unguessable
-  UUIDs, which is adequate for a prototype and **not** adequate for production — invoice PDFs
-  are confidential and want signed, expiring URLs.
+- **Uploaded files are served unauthenticated**, and now that everything else requires a token
+  this is the weakest point in the system. `GET /files/:name` is explicitly `@Public()` because
+  the extraction service fetches it as an anonymous HTTP client. Unguessable UUIDs are all that
+  protect a confidential invoice PDF, and a URL that never expires and needs no credential will
+  end up in a log, a proxy or a browser history. Wants **signed, expiring URLs**.
 - **Files are stored on local disk** (`backend/uploads/`), so the API is no longer stateless and
   a second replica would not see the first's uploads. Swap `FileStorageService` for S3/blob.
 - **Posting does not contact anything.** The `erpDocumentNumber` is generated locally and looks
@@ -849,8 +904,8 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 - **No tests at all.** Verified by driving a real browser against the running API, not by
   anything repeatable. No component tests, no e2e suite. This is now the largest untested
   surface in the repo: ~2,600 lines of UI against 246 backend unit tests.
-- **Identity is picked, not authenticated.** Both the tenant field and the "acting as" role
-  switcher are prototype affordances to be deleted when SSO lands, not adapted.
+- ~~**Identity is picked, not authenticated.**~~ Both were deleted when auth landed. The shell
+  now signs in against the OIDC issuer and reads identity from `GET /auth/me`.
 - **No way to resolve an exception from the UI.** `invoiceExceptions.resolvedAt` is only ever
   set automatically by re-validation; a human cannot dismiss one.
 - **Duplicated constants.** `CONFIDENCE_REVIEW_THRESHOLD`, the correctable-field list and

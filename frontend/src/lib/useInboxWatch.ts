@@ -46,7 +46,7 @@ export function useInboxWatch(approverId: string): { waiting: number } {
     async function poll() {
       let items: InboxItem[];
       try {
-        items = await api.inbox(approverId);
+        items = await api.inbox();
       } catch {
         return; // A failed poll is not worth a toast; the next one will catch up.
       }

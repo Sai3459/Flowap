@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, session } from '../api/client';
+import { api } from '../api/client';
 import type { ApprovalHistoryItem, InboxItem, TenantUser } from '../api/types';
 import { useApi } from '../lib/useApi';
 import { Empty, ErrorNote, Loading, Money, StatusPill, StepPill } from '../components/ui';
@@ -17,7 +17,7 @@ import { notifyInboxChanged } from '../lib/useInboxWatch';
  */
 export function ApprovalsPage() {
   const { lift } = useEffectsApi();
-  const approverId = session.userId();
+  
   const [tab, setTab] = useState<'inbox' | 'history'>('inbox');
   const [busyStep, setBusyStep] = useState<string | null>(null);
   const [comment, setComment] = useState<Record<string, string>>({});
@@ -25,11 +25,11 @@ export function ApprovalsPage() {
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
-  const inbox = useApi<InboxItem[]>(() => api.inbox(approverId), [approverId]);
-  const history = useApi<ApprovalHistoryItem[]>(() => api.approvalHistory(approverId), [approverId]);
+  // Both are session-scoped now — the server answers for whoever the token says we are, so
+  // there is no id to pass and nothing to re-fetch when it changes.
+  const inbox = useApi<InboxItem[]>(() => api.inbox(), []);
+  const history = useApi<ApprovalHistoryItem[]>(() => api.approvalHistory(), []);
   const { data: users } = useApi<TenantUser[]>(() => api.listUsers(), []);
-
-  if (!approverId) return <div className="notice">Pick who you are acting as in the sidebar first.</div>;
 
   async function act(
     stepId: string,
@@ -128,7 +128,7 @@ export function ApprovalsPage() {
                       className="approve bulb"
                       disabled={busyStep === item.step.id}
                       onClick={(e) => act(item.step.id,
-                        () => api.decide(item.step.id, 'APPROVE', approverId, comment[item.step.id]),
+                        () => api.decide(item.step.id, 'APPROVE', comment[item.step.id]),
                         `Approved ${item.invoiceNumber ?? 'invoice'}.`,
                         {
                           title: 'Invoice approved',
@@ -142,7 +142,7 @@ export function ApprovalsPage() {
                       className="reject"
                       disabled={busyStep === item.step.id}
                       onClick={(e) => act(item.step.id,
-                        () => api.decide(item.step.id, 'REJECT', approverId, comment[item.step.id]),
+                        () => api.decide(item.step.id, 'REJECT', comment[item.step.id]),
                         `Rejected ${item.invoiceNumber ?? 'invoice'}.`,
                         {
                           title: 'Invoice rejected',
@@ -161,14 +161,14 @@ export function ApprovalsPage() {
                       onChange={(e) => setDelegateTo({ ...delegateTo, [item.step.id]: e.target.value })}
                     >
                       <option value="">choose a colleague…</option>
-                      {(users ?? []).filter((u) => u.id !== approverId).map((u) => (
+                      {(users ?? []).map((u) => (
                         <option key={u.id} value={u.id}>{u.name} · {u.role}</option>
                       ))}
                     </select>
                     <button
                       disabled={!delegateTo[item.step.id] || busyStep === item.step.id}
                       onClick={() => act(item.step.id,
-                        () => api.delegate(item.step.id, approverId, delegateTo[item.step.id], comment[item.step.id]),
+                        () => api.delegate(item.step.id, delegateTo[item.step.id], comment[item.step.id]),
                         'Handed off — the delegate keeps your original SLA deadline.')}
                     >Delegate</button>
                   </div>

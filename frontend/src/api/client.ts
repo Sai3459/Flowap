@@ -13,24 +13,31 @@ import type {
   PurchaseOrder,
   ReadyToPostItem,
   TenantUser,
+  CurrentUser,
 } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000';
 
 /**
- * Tenant and current user are both client-held, because the backend still resolves the tenant
- * from an `x-tenant-id` header and has no login at all. The user picker is a stand-in for
- * authentication so approvals can be exercised as different people — it disappears entirely
- * when SSO lands, and nothing else in the UI depends on it existing.
+ * The session is now a **bearer token**, and that is all the client holds.
+ *
+ * What used to be here — a tenant id typed into the header bar and a user picker — is gone.
+ * Both were client-supplied identity: the tenant went out as `x-tenant-id`, and "acting as"
+ * chose whose approvals you could cast. Neither exists any more, because neither could be
+ * made safe. The backend derives tenant, user and role from the token's subject, so there is
+ * nothing identity-shaped left for the browser to assert.
+ *
+ * The token is kept in localStorage, which is the pragmatic choice for a dev-issuer flow and
+ * is **not** where a production build should keep it — an httpOnly cookie or an in-memory
+ * token with a silent-refresh iframe both survive XSS better. Noted rather than solved.
  */
-const TENANT_KEY = 'flowap.tenantId';
-const USER_KEY = 'flowap.userId';
+const TOKEN_KEY = 'flowap.accessToken';
 
 export const session = {
-  tenantId: () => localStorage.getItem(TENANT_KEY) ?? (import.meta.env.VITE_TENANT_ID as string | undefined) ?? '',
-  setTenantId: (id: string) => localStorage.setItem(TENANT_KEY, id.trim()),
-  userId: () => localStorage.getItem(USER_KEY) ?? '',
-  setUserId: (id: string) => localStorage.setItem(USER_KEY, id),
+  token: () => localStorage.getItem(TOKEN_KEY) ?? '',
+  setToken: (t: string) => localStorage.setItem(TOKEN_KEY, t),
+  clear: () => localStorage.removeItem(TOKEN_KEY),
+  isSignedIn: () => Boolean(localStorage.getItem(TOKEN_KEY)),
 };
 
 export class ApiError extends Error {
@@ -43,10 +50,13 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit, rawBody = false): Promise<T> {
-  const tenantId = session.tenantId();
-  if (!tenantId) throw new ApiError('No tenant selected.', 0);
+  const token = session.token();
+  if (!token) throw new ApiError('Not signed in.', 401);
 
-  const headers: Record<string, string> = { 'x-tenant-id': tenantId, ...(init?.headers as Record<string, string>) };
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    ...(init?.headers as Record<string, string>),
+  };
   if (!rawBody) headers['Content-Type'] = 'application/json';
 
   let response: Response;
@@ -74,6 +84,7 @@ async function readError(response: Response): Promise<string> {
 }
 
 export const api = {
+  me: () => request<CurrentUser>('/auth/me'),
   // --- directory / session ---
   listUsers: () => request<TenantUser[]>('/users'),
 
@@ -113,18 +124,18 @@ export const api = {
   },
 
   // --- approvals ---
-  inbox: (approverId: string) => request<InboxItem[]>(`/approvals/inbox/${approverId}`),
-  approvalHistory: (approverId: string) => request<ApprovalHistoryItem[]>(`/approvals/history/${approverId}`),
+  inbox: () => request<InboxItem[]>('/approvals/inbox'),
+  approvalHistory: () => request<ApprovalHistoryItem[]>('/approvals/history'),
   approvalProgress: (invoiceId: string) => request<ApprovalProgress | null>(`/approvals/${invoiceId}/progress`),
-  decide: (stepId: string, decision: 'APPROVE' | 'REJECT', approverId: string, comment?: string) =>
+  decide: (stepId: string, decision: 'APPROVE' | 'REJECT', comment?: string) =>
     request<unknown>(`/approvals/steps/${stepId}/decide`, {
       method: 'POST',
-      body: JSON.stringify({ decision, approverId, comment }),
+      body: JSON.stringify({ decision, comment }),
     }),
-  delegate: (stepId: string, fromApproverId: string, toApproverId: string, comment?: string) =>
+  delegate: (stepId: string, toApproverId: string, comment?: string) =>
     request<unknown>(`/approvals/steps/${stepId}/delegate`, {
       method: 'POST',
-      body: JSON.stringify({ fromApproverId, toApproverId, comment }),
+      body: JSON.stringify({ toApproverId, comment }),
     }),
 
   // --- cost assignment ---
@@ -144,10 +155,9 @@ export const api = {
   // --- posting ---
   readyToPost: () => request<ReadyToPostItem[]>('/posting/ready'),
   postedInvoices: () => request<InvoiceListItem[]>('/posting/posted'),
-  postInvoice: (invoiceId: string, postedById?: string) =>
+  postInvoice: (invoiceId: string) =>
     request<InvoiceDetail>(`/invoices/${invoiceId}/post`, {
       method: 'POST',
-      body: JSON.stringify({ postedById }),
     }),
 
   // --- purchase orders ---

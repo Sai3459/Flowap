@@ -6,22 +6,23 @@ import {
   Param,
   Patch,
   Post,
-  Headers,
   Res,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
-import { ApiTags, ApiHeader } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InvoicesService } from './invoices.service';
 import { FileStorageService } from './file-storage.service';
 import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { Principal } from '../auth/principal';
 
 // Tenant is resolved from a header for the prototype. In production this comes from
 // the authenticated session (SSO claim), never a client-supplied header.
 @ApiTags('invoices')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller('invoices')
 export class InvoicesController {
   constructor(
@@ -30,7 +31,7 @@ export class InvoicesController {
   ) {}
 
   @Post()
-  ingest(@Headers('x-tenant-id') tenantId: string, @Body() dto: IngestInvoiceDto) {
+  ingest(@CurrentUser() { tenantId }: Principal, @Body() dto: IngestInvoiceDto) {
     return this.invoicesService.ingest(tenantId, dto);
   }
 
@@ -42,7 +43,7 @@ export class InvoicesController {
   @Post('upload')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }))
   async upload(
-    @Headers('x-tenant-id') tenantId: string,
+    @CurrentUser() { tenantId }: Principal,
     @UploadedFile() file: { originalname: string; mimetype: string; buffer: Buffer } | undefined,
     @Body('sourceChannel') sourceChannel?: string,
   ) {
@@ -64,23 +65,23 @@ export class InvoicesController {
   }
 
   @Get()
-  list(@Headers('x-tenant-id') tenantId: string) {
+  list(@CurrentUser() { tenantId }: Principal) {
     return this.invoicesService.findAll(tenantId);
   }
 
   @Get('exceptions')
-  exceptionQueue(@Headers('x-tenant-id') tenantId: string) {
+  exceptionQueue(@CurrentUser() { tenantId }: Principal) {
     return this.invoicesService.findExceptionQueue(tenantId);
   }
 
   @Get(':id')
-  findOne(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+  findOne(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.invoicesService.findOne(tenantId, id);
   }
 
   @Patch(':id/correct-field')
   correctField(
-    @Headers('x-tenant-id') tenantId: string,
+    @CurrentUser() { tenantId }: Principal,
     @Param('id') id: string,
     @Body() dto: CorrectFieldDto,
   ) {
@@ -94,7 +95,7 @@ export class InvoicesController {
    * past the confidence gate.
    */
   @Post(':id/revalidate')
-  revalidate(@Headers('x-tenant-id') tenantId: string, @Param('id') id: string) {
+  revalidate(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
     return this.invoicesService.revalidate(tenantId, id, { force: true });
   }
 }

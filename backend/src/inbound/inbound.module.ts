@@ -1,9 +1,11 @@
-import { Body, Controller, Get, Headers, Injectable, Logger, Module, Post } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Logger, Module, Post } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { ApiHeader, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InvoicesModule } from '../invoices/invoices.module';
 import { ImapMailboxSource } from './imap-mailbox.source';
 import { MailboxService, type PollResult } from './mailbox.service';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { Principal } from '../auth/principal';
 
 /**
  * Runs the inbound sweep on a schedule.
@@ -57,14 +59,14 @@ export class InboundSchedulerService {
 }
 
 @ApiTags('inbound')
-@ApiHeader({ name: 'x-tenant-id', required: true })
+@ApiBearerAuth()
 @Controller('inbound')
 export class InboundController {
   constructor(private readonly mailbox: MailboxService) {}
 
   /** What has arrived by mail, and what was skipped and why. */
   @Get('messages')
-  messages(@Headers('x-tenant-id') tenantId: string) {
+  messages(@CurrentUser() { tenantId }: Principal) {
     return this.mailbox.recent(tenantId);
   }
 
@@ -74,7 +76,7 @@ export class InboundController {
    */
   @Post('poll')
   async poll(
-    @Headers('x-tenant-id') tenantId: string,
+    @CurrentUser() { tenantId }: Principal,
     @Body('limit') limit?: number,
   ): Promise<PollResult | { configured: false; reason: string }> {
     const source = ImapMailboxSource.fromEnv();

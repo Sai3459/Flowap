@@ -158,8 +158,8 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 355 unit tests — no DB, no server
-cd backend && npm run test:integration   # 134 integration tests — needs DATABASE_URL
+cd backend && npm test               # 380 unit tests — no DB, no server
+cd backend && npm run test:integration   # 147 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm test              # 158 tests (vitest + jsdom) — no DB, no server
 cd frontend && npm run build         # typecheck + build (tsc -b && vite build)
@@ -218,8 +218,8 @@ running API, so the CSS, the layout and the Web Animations timing of the lift ef
 verified only by hand.
 
 **CI is real.** `.github/workflows/ci.yml` fires on every push and has been green on GitHub's
-runners on every run so far. It runs three jobs: the backend's typecheck, 355 unit tests and
-134 integration tests against a real `postgres:16-alpine` service container; the extraction
+runners on every run so far. It runs three jobs: the backend's typecheck, 380 unit tests and
+147 integration tests against a real `postgres:16-alpine` service container; the extraction
 service's 19 Python tests; and the frontend's typecheck, build and 158 tests. So the suites are
 proven to pass on a clean machine from scratch, not just on a developer's warm one.
 
@@ -336,6 +336,94 @@ invoice has been. (The 0h figures above are an artefact of a corpus created in o
 
 `GET /metrics/touchless/breakdown` returns the per-invoice working, because a rate nobody can
 audit is a rate nobody should quote.
+
+## The copilot: autonomous exception resolution (SHADOW only — not approved)
+
+`src/copilot/`. **Built, tested, and deliberately not switched on anywhere.** The exception
+types and the confidence policy are awaiting review; `copilotMode` defaults to `OFF` for every
+tenant and no live tenant has been changed.
+
+### Three modes, and OFF is the real default
+`tenants.copilotMode` — `OFF | SHADOW | ACTIVE` (`drizzle/0008_copilot.sql`). `OFF` means the
+copilot is never consulted and behaviour is byte-identical to before it existed; there is an
+integration test asserting exactly that, including that no decision row is written. `SHADOW`
+runs the rules and records what they *would* have done, changing nothing. Only `ACTIVE` acts.
+
+Three states rather than a boolean because the useful question is not "on or off" but "have we
+earned the right to turn it on", and only a shadow period answers that.
+
+### Strictly additive
+One decision point, immediately before a `MISSING_PO` exception is written in `runPoMatch`.
+It either returns false — every existing path, unchanged — or it corrected the input and the
+match is re-run. Matching, exception semantics and workflow routing are untouched.
+
+### The confidence policy is not a single number, and one gate is inverted
+- **Rule A — `ARITHMETIC_FIELD`.** A low-confidence money field that `subtotal + tax = total`
+  settles to the cent. The corroboration is arithmetic, not judgement. Confidence is a
+  **floor of 0.95 on the two supporting fields** — above the 0.9 review threshold on purpose,
+  since 0.9 means "no human need look" and acting is a stronger claim. Confirming a shaky total
+  against a shaky subtotal only proves two guesses agree, so that is refused.
+- **Rule B — `PO_NUMBER_NEAR_MISS`.** Corrects a mistyped PO number when **exactly one**
+  same-vendor order is within edit distance 2 (after folding the character pairs OCR confuses)
+  and the invoice net is within the order's total. Confidence here is a **ceiling of 0.9**, not
+  a floor. A `MISSING_PO` means either the model misread the number *or* it read it correctly
+  and the order has not been synced yet — opposite responses, and the late-PO re-validation
+  path already handles the second. Rewriting a number the model was sure of would attach an
+  invoice to an order the document never named. A global "autonomy threshold" would encode
+  precisely the wrong behaviour for one of these two rules.
+
+**Vendor agreement is the gate doing the real work** in rule B: paying vendor A against vendor
+B's order is the actual harm, and requiring the candidate to belong to the same vendor removes
+nearly all of it. Two plausible candidates is a hard stop, never a tiebreak.
+
+### Everything is visible and reversible
+Every decision is recorded in `copilotDecisions`, **including every refusal** — "the copilot
+looked and declined" is information a reviewer needs, and it is the denominator for any
+precision claim. An applied resolution also writes a `COPILOT`-attributed audit event beside
+the human ones, carrying the rule, the plain-language reasoning and the machine-readable
+working. `revert()` restores the previous value and stamps the decision row, because a human
+undoing a resolution is the strongest evidence a rule is wrong and should not look like an
+ordinary edit.
+
+### Measured in shadow on our own corpus
+Rules run against the live data, mutating nothing: **1 resolve, 4 escalate.**
+
+| Invoice | Rule | Outcome |
+|---|---|---|
+| INV-4002 | PO near-miss | escalate — extraction was 95% confident, so the order is probably just unsynced |
+| INV-9001 ×3 | arithmetic | escalate — the supporting fields are themselves at 40% |
+| 260011 | arithmetic | **resolve** — tax 0.00 at 55%, and 800.00 − 800.00 = 0.00 confirms it |
+
+The single resolve is the Ready4people invoice whose VAT template has a blank charged column;
+CLAUDE.md already records the model as "right and appropriately unsure" there, and the
+arithmetic agrees. Residual risk, stated plainly: a genuinely missed tax line and a genuine
+zero are indistinguishable by arithmetic alone — the protection is that the total is required
+at ≥0.95, so both readings would have to be wrong together.
+
+### Two bugs the shadow run found that tests had not
+- **Gross versus net.** Rule B compared the invoice's *gross* total against the purchase
+  order's *net* header total, so a 1,200.00 order billed as 1,200.00 + 96.00 tax read as an 8%
+  overrun and every taxed invoice was refused. Same shape as the gross-vs-net bug already
+  documented for PO matching. The caller now passes the subtotal.
+- **Reasoning that did not match the arithmetic.** One hardcoded sentence was emitted whichever
+  field was settled, so confirming a *tax* amount produced "Subtotal 800.00 plus tax 0.00
+  equals 0.00" — describing an addition that was never performed. The tests asserted the
+  decision and never read the sentence. On an autonomous action the reasoning *is* the audit
+  record.
+
+### Not built, deliberately
+Vendor-name variants were proposed as an obvious candidate and are **not** included.
+`normaliseVendorName()` already resolves the deterministic cases at ingest, so what reaches an
+exception is precisely the residue this codebase refuses to merge — "Acme Supplies" versus
+"Acme Supply Co" — where a wrong merge points payments at the wrong bank account. The safe
+version needs corroboration independent of the name, i.e. a tax-ID match, and `vendors.taxId`
+is never populated. Also out: `DUPLICATE_INVOICE` (auto-dismissing enables double payment) and
+every variance type (a variance is a decision an approver is *entitled* to make).
+
+**The copilot is not the main lever on the touchless rate.** On the completed corpus the
+reasons split 75% approval / 25% correction; the copilot attacks the correction quarter. The
+approval three-quarters needs an auto-approve path, which is workflow configuration rather than
+an AI feature.
 
 ## Core design decisions baked into the code (don't casually change these)
 
@@ -1179,10 +1267,9 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 5. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
    frequency counts over this vendor's history, not a model call), plain-language explanations
    of why an invoice is stuck (`_consistency_warnings` is a natural input).
-   **Autonomous exception resolution is proposed but not built** — the exception types and the
-   confidence threshold are awaiting review before anything auto-resolves a real invoice. The
-   `COPILOT` actor kind and the `copilotActions` disclosure on the dashboard exist ready for it;
-   nothing writes either.
+   **Autonomous exception resolution is built and running in SHADOW only** — see "The copilot"
+   above. Two rules, flag-gated per tenant, default OFF, never enabled on a live tenant pending
+   review of the exception list and the confidence policy.
 6. **Feedback loop** — `/feedback` on the extraction service is a stub; corrections should
    persist per tenant/vendor-layout and feed back into the prompt as few-shot examples.
 7. **Vendor portal** — separate, simplified auth context and shell.

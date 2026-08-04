@@ -82,6 +82,18 @@ export const tenants = pgTable('tenants', {
    * COA is inert until an administrator has entered limits and turned it on.
    */
   enforceApprovalLimits: boolean('enforce_approval_limits').default(false).notNull(),
+  /**
+   * Autonomous exception resolution: 'OFF' | 'SHADOW' | 'ACTIVE'.
+   *
+   * `OFF` is the default and means byte-identical current behaviour — the copilot is never
+   * consulted. `SHADOW` runs the rules and records what they *would* have done without
+   * changing anything, so precision can be measured on real traffic before anything is
+   * trusted. `ACTIVE` applies resolutions.
+   *
+   * Three states rather than a boolean because the interesting question is not "on or off"
+   * but "have we earned the right to turn it on", and only a shadow period answers that.
+   */
+  copilotMode: text('copilot_mode').notNull().default('OFF'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -458,6 +470,44 @@ export const erpConnections = pgTable('erp_connections', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantIdx: index('erp_tenant_idx').on(t.tenantId),
+}));
+
+/**
+ * Every decision the copilot reached, including the ones where it declined.
+ *
+ * Declines are recorded on purpose. "The copilot looked at this and would not touch it" is
+ * information a reviewer needs, and it is also the denominator for any claim about precision —
+ * without it there is no way to distinguish a rule that is careful from one that never fires.
+ *
+ * Separate from `auditEvents` because these rows exist even when nothing happened, and an
+ * audit trail of actions should not fill up with non-actions. An *applied* decision writes
+ * both: a row here and a COPILOT-attributed audit event beside the human ones.
+ */
+export const copilotDecisions = pgTable('copilot_decisions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull(),
+  invoiceId: uuid('invoice_id').references(() => invoices.id).notNull(),
+  rule: text('rule').notNull(),
+  /** 'RESOLVE' | 'ESCALATE' — what the rule concluded. */
+  outcome: text('outcome').notNull(),
+  /** The mode in force when this was decided, so a shadow record is never mistaken for a real one. */
+  mode: text('mode').notNull(),
+  /** Plain-language reasoning, for the person auditing it rather than for a machine. */
+  reasoning: text('reasoning').notNull(),
+  /** The working: candidates considered, distances, amounts. A claim that can be re-checked. */
+  evidence: jsonb('evidence'),
+  field: text('field'),
+  previousValue: text('previous_value'),
+  proposedValue: text('proposed_value'),
+  /** Null in shadow mode, and null for an escalation. Set only when the change was really made. */
+  appliedAt: timestamp('applied_at'),
+  /** Set when a human undid it — the signal that the rule got something wrong. */
+  revertedAt: timestamp('reverted_at'),
+  revertedById: uuid('reverted_by_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  tenantIdx: index('copilot_tenant_idx').on(t.tenantId),
+  invoiceIdx: index('copilot_invoice_idx').on(t.invoiceId),
 }));
 
 export const auditEvents = pgTable('audit_events', {

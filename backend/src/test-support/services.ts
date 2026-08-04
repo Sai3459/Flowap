@@ -19,6 +19,7 @@ import { CodingService } from '../coding/coding.service';
 import { PostingService } from '../posting/posting.service';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { TouchlessService } from '../metrics/touchless.service';
+import { CopilotService } from '../copilot/copilot.service';
 import { StubExtractionClient, scenario } from './fixtures';
 import type { TestDb } from './db';
 
@@ -31,6 +32,7 @@ export interface TestServices {
   posting: PostingService;
   dashboard: DashboardService;
   touchless: TouchlessService;
+  copilot: CopilotService;
   /** Controls what the next ingest will "extract". */
   extraction: StubExtractionClient;
 }
@@ -41,12 +43,14 @@ export function buildServices(db: TestDb): TestServices {
 
   const workflow = new WorkflowEngineService(database);
   const vendors = new VendorsService(database);
+  const copilot = new CopilotService(database);
   const invoices = new InvoicesService(
     database,
     extraction as never, // structurally compatible: the pipeline only ever calls extract()
     workflow,
     vendors,
     new FileStorageService(),
+    copilot,
   );
   const purchaseOrders = new PurchaseOrdersService(database, vendors, invoices);
 
@@ -61,6 +65,7 @@ export function buildServices(db: TestDb): TestServices {
     posting: new PostingService(database),
     dashboard: new DashboardService(database, touchless),
     touchless,
+    copilot,
     extraction,
   };
 }

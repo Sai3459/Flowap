@@ -9,6 +9,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { SYSTEM_ACTOR, type AuditActor } from '../metrics/touchless';
+import { CopilotService } from '../copilot/copilot.service';
 import {
   approvalInstances,
   approvalSteps,
@@ -312,6 +313,7 @@ export class InvoicesService {
     private readonly workflowEngine: WorkflowEngineService,
     private readonly vendorsService: VendorsService,
     private readonly fileStorage: FileStorageService,
+    private readonly copilot: CopilotService,
   ) {}
 
   private get db() {
@@ -660,6 +662,18 @@ export class InvoicesService {
       .where(and(eq(purchaseOrders.tenantId, tenantId), eq(purchaseOrders.poNumber, invoice.poNumber)));
 
     if (!po) {
+      // The copilot's only decision point, placed immediately before the exception is raised.
+      //
+      // Strictly additive: with `copilotMode = 'OFF'` — the default for every tenant — this
+      // returns false without touching anything and the original path below runs unchanged.
+      // In SHADOW it records what it would have done and still returns false. Only in ACTIVE
+      // can it return true, meaning it corrected the PO number and the match is worth
+      // re-running. Nothing about matching, exception semantics or routing is modified.
+      if (await this.copilot.tryResolveMissingPo(tenantId, invoice)) {
+        const [updated] = await this.db.select().from(invoices).where(eq(invoices.id, invoice.id));
+        return this.runPoMatch(tenantId, updated);
+      }
+
       await this.db.insert(invoiceExceptions).values({
         invoiceId: invoice.id,
         type: 'MISSING_PO',

@@ -1,8 +1,13 @@
-# The first automated check this repo has ever had.
+# The automated check for the whole repo: backend unit + integration, the extraction service's
+# Python suite, and the frontend's typecheck, build and tests.
 #
-# NOT VERIFIED: written in a sandbox with no GitHub runner, so this has never executed. Every
-# command in it was run by hand locally and passes; the workflow wiring itself is unproven
-# until the first push builds.
+# This has run on GitHub's runners since it was added and is green on every push. (It carried a
+# "NOT VERIFIED — has never executed" note for a long time after that stopped being true; if you
+# are about to make a claim about CI here, check the Actions tab first.)
+#
+# Note this workflow contains no reference to docker-compose or any Dockerfile — it uses a
+# service container and runs commands directly on the runner. A green run says nothing about
+# whether the compose stack builds.
 name: CI
 
 on:
@@ -89,7 +94,7 @@ jobs:
         working-directory: extraction-service
 
   frontend:
-    name: Frontend — typecheck + build
+    name: Frontend — typecheck + build + tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,7 +108,15 @@ jobs:
       - run: npm ci
         working-directory: frontend
 
-      # `npm run build` is `tsc -b && vite build`, so this typechecks and builds in one.
-      # There are still no frontend tests at all — see CLAUDE.md.
+      # `npm run build` is `tsc -b && vite build`, so this typechecks and builds in one. The
+      # test files are typechecked too, under their own project (tsconfig.test.json).
       - run: npm run build
+        working-directory: frontend
+
+      # Vitest + jsdom. Needs no server and no database: the suite drives the real API client
+      # against a fake at the `fetch` boundary. Two of the tests read the *backend's* source off
+      # disk as drift guards, which is why this job checks out the whole repo rather than just
+      # frontend/.
+      - name: Tests
+        run: npm test
         working-directory: frontend

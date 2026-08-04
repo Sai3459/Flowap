@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
+    // Node types live here and nowhere else. The drift guards read the backend's source off
+    // disk, which needs `node:fs`; letting the application project see `process` and `fs` would
+    // make it possible to reach for them in code that has to run in a browser.
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-support"],
+  "exclude": []
+}

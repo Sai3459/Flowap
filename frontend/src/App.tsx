@@ -22,7 +22,7 @@ import { UploadPage } from './pages/UploadPage';
  * drift produces a visible 403 rather than unauthorised access. A UI role check is never a
  * security boundary.
  */
-const NAV_ROLES = {
+export const NAV_ROLES = {
   overview: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'],
   upload: ['AP_CLERK', 'AP_MANAGER'],
   invoices: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'],

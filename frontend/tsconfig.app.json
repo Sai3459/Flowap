@@ -22,5 +22,8 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Test files and their support code compile under tsconfig.test.json instead, which is
+  // the only project that gets Node types.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-support"]
 }

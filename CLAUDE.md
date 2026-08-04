@@ -161,7 +161,8 @@ An account must already exist — a valid token for an unknown email is refused,
 cd backend && npm test               # 336 unit tests — no DB, no server
 cd backend && npm run test:integration   # 119 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
-cd frontend && npm run build         # typecheck + build; there are no frontend tests
+cd frontend && npm test              # 150 tests (vitest + jsdom) — no DB, no server
+cd frontend && npm run build         # typecheck + build (tsc -b && vite build)
 ```
 
 `test:integration` derives its database by appending `_test` to `DATABASE_URL`'s database
@@ -174,13 +175,57 @@ Test files run in separate processes concurrently by default, and they share one
 database, so integration runs are pinned to `--test-concurrency=1`. Without it the files
 truncate each other mid-run and everything fails at once.
 
-**CI is real.** `.github/workflows/ci.yml` has run **10 times on GitHub's runners, all green**,
-most recently against `9bc43a7`. It fires on every push and runs four jobs: typecheck, 336 unit
-tests, 119 integration tests against a real `postgres:16-alpine` service container, 19 Python
-tests, and the frontend build. So the suites are proven to pass on a clean machine from
-scratch, not just on a developer's warm one. (This entry previously said the workflow had never
-executed. That was true when written and stayed in the file long after it stopped being true —
-check the Actions tab before repeating a claim like this.)
+### The frontend suite (`frontend/src/**/*.test.tsx`)
+
+Vitest + jsdom + Testing Library. 150 tests over the fourteen source modules; it needs no
+server, no database and no browser, so it runs in about eleven seconds anywhere.
+
+**Screens are driven through the real `api/client.ts`, with the fake standing in at the
+`fetch` boundary** (`src/test-support/fake-api.ts`). Mocking the `api` object instead would be
+easier and much weaker: it proves a page called some function, not that the right request went
+out. Several of these tests assert what is *absent* from a request body — an approver id, a
+posting actor — and that is only visible at the transport level. `beforeEach` also stubs
+`fetch` to throw, so a call nobody stubbed fails in the test that caused it rather than
+silently hitting whatever is listening on port 3000.
+
+**Two tests read the backend's own source off disk as drift guards**, the same technique
+`backend/src/test-support/fixtures.spec.ts` uses against the Python mock:
+- `confidence.test.ts` compares `CONFIDENCE_REVIEW_THRESHOLD`, the correctable-field list and
+  the date/money classifications against `extraction-client.service.ts` and
+  `invoices.service.ts`. These were a listed gap — restated constants with nothing checking
+  they still agreed, failing quietly in both directions.
+- `App.test.tsx` compares `NAV_ROLES` against the MATRIX in `backend/src/auth/rbac.int-spec.ts`,
+  which is itself asserted route by route in both directions against a running application.
+  So the mirror is checked against the statement the server is already tested against, not
+  against a second opinion.
+
+Both resolve paths from the test file's own location rather than `process.cwd()`
+(`src/test-support/repo.ts`) — a guard that quietly fails to find its target is worse than no
+guard. Note the guards mean **the frontend suite needs the whole repository checked out**, not
+just `frontend/`.
+
+The security- and money-adjacent assertions were mutation-checked individually: removing the
+no-token guard, adding an `approverId` to the decide body, setting `Content-Type` on the
+multipart upload, dropping `session.clear()` on a 401, drifting `NAV_ROLES`, flashing success
+before the request resolves (approve *and* post), skipping the approval-chain refetch after a
+correction, comparing inbox counts instead of step ids, removing the posting coding-gate,
+enabling the half-coded save, reporting every upload as cleared, and sending a cleared
+receipt box as 0 — each fails the suite. Two mutations initially survived and the tests were
+strengthened rather than the mutations discarded.
+
+There are still **no browser-level end-to-end tests**: nothing drives a real Chromium against a
+running API, so the CSS, the layout and the Web Animations timing of the lift effect remain
+verified only by hand.
+
+**CI is real.** `.github/workflows/ci.yml` fires on every push and has been green on GitHub's
+runners on every run so far. It runs three jobs: the backend's typecheck, 336 unit tests and
+119 integration tests against a real `postgres:16-alpine` service container; the extraction
+service's 19 Python tests; and the frontend's typecheck, build and 150 tests. So the suites are
+proven to pass on a clean machine from scratch, not just on a developer's warm one.
+
+(This entry previously said the workflow had never executed, then carried a run count that went
+stale. Both were true when written. Check the Actions tab rather than trusting a number in this
+file, and match the run's `head_sha` against the commit you care about.)
 
 ⚠️ **CI passing is not evidence for `docker-compose.yml`.** The workflow contains zero
 references to compose or any Dockerfile — it uses a service container and runs commands
@@ -319,7 +364,7 @@ node — there's a regression test for exactly that.
   rejection short-circuiting pending siblings, delegation mid-parallel-group, SLA breach
   routing down an `onSlaBreach` edge, and tenant isolation on every new endpoint.
 - **Unit tests** — `npm test` (Node's built-in runner via `node:test`, no extra deps).
-  246 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
+  336 tests covering `resolveNodeOutcome`, `evaluateCondition`, `validateGraph`, the PO matching
   functions (`matchInvoiceToPo`, `pairLines`, `variancePct`, `resolveTolerances`),
   `validatePoPayload`, the re-validation rules (`revalidationDecision`,
   `correctionBlockedByApproval`), the fixture drift guard, vendor-name normalisation, the
@@ -410,7 +455,7 @@ node — there's a regression test for exactly that.
     classes with constructor injection, so `@nestjs/testing` buys nothing. Only the extractor
     is stubbed; matching, workflow traversal, coding, posting and the audit trail are all
     production code against real Postgres.
-  - **66 integration tests** (`*.int-spec.ts`) over the paths that were previously
+  - **119 integration tests** (`*.int-spec.ts`) over the paths that were previously
     hand-verified only: the nine ingestion scenarios end to end, net-vs-net PO comparison,
     duplicate detection, late-PO re-validation, workflow traversal, ALL/ANY node semantics,
     sibling skipping, delegation not deadlocking an ALL node, SLA inheritance on handoff, the
@@ -427,9 +472,13 @@ node — there's a regression test for exactly that.
     by breaking a number and watching it fail.
   - **`extraction-service/test_consistency.py`** — 19 tests for the arithmetic pass, which had
     none (see design decision 2).
-  - **`.github/workflows/ci.yml`** — now green on GitHub's runners on every push (10 runs).
-    **`docker-compose.yml`** and the three Dockerfiles remain built-never, blocked on the image
-    registry rather than on Docker. See "How to run locally".
+  - **150 frontend tests** (vitest + jsdom, `frontend/src/**/*.test.tsx`) — the last untested
+    surface in the repo. Screens run against the real API client with a fake at the `fetch`
+    boundary, so the assertions reach the actual request bodies. See "The frontend suite" under
+    Tests for what that buys and what it still does not cover.
+  - **`.github/workflows/ci.yml`** — green on GitHub's runners on every push; now runs the
+    frontend suite too. **`docker-compose.yml`** and the three Dockerfiles remain built-never,
+    blocked on the image registry rather than on Docker. See "How to run locally".
 - **SLA escalation scheduler** — `SlaSchedulerService` runs `escalateOverdueStepsAllTenants()`
   on a cron (default every 10 min; `SLA_ESCALATION_CRON` to change, `SLA_ESCALATION_ENABLED=false`
   to disable). Escalations now fire without anyone calling the endpoint. Each breach is
@@ -592,6 +641,14 @@ node — there's a regression test for exactly that.
     aggressive ease-out across the whole thing collapses the rise into the first ~8% and the
     card just appears. Verified by scrubbing the animation in a real browser: at 250ms it is
     at scale 0.74 / z −162 / opacity 0.55, settled by 1700ms, gone by 2600ms.
+    The origin is resolved by asking whether it can be measured (`originRect`), **not** with
+    `origin instanceof DOMRect`. A rect from another realm fails that test, falls through to
+    being treated as an element, and the missing `getBoundingClientRect` throws *inside* the
+    `requestAnimationFrame` callback — where nothing catches it, `onfinish` is never wired, and
+    the confirmation card stays on screen covering the workspace. Found by writing the tests:
+    jsdom's `getBoundingClientRect` returns a plain object rather than a `DOMRect`, which is a
+    jsdom gap rather than a browser one, but it showed the shape of a real failure. The setup
+    file now makes jsdom match the browser, *and* the check no longer depends on identity.
 
 ## Authentication (Phase 1 — complete)
 
@@ -1129,33 +1186,35 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
   which is exactly the dynamic approver type the workflow engine still lacks.
 
 ### Known gaps in the frontend
-- **No tests at all.** Verified by driving a real browser against the running API, not by
-  anything repeatable. No component tests, no e2e suite. This is now the largest untested
-  surface in the repo: ~2,600 lines of UI against 246 backend unit tests.
+- ~~**No tests at all.**~~ Built — 150 vitest tests, see "The frontend suite" above.
 - ~~**Identity is picked, not authenticated.**~~ Both were deleted when auth landed. The shell
   now signs in against the OIDC issuer and reads identity from `GET /auth/me`.
+- ~~**Duplicated constants.**~~ Still duplicated, but no longer unguarded: `confidence.test.ts`
+  compares the threshold, the correctable-field list and the date/money classifications against
+  the backend source that owns them. The copies remain a maintenance cost; they are no longer a
+  silent one.
+- ~~**Purchase orders are API-only in the UI.**~~ Stale — `PurchaseOrdersPage` lists orders,
+  shows lines, records goods receipts and syncs a PO. (This bullet contradicted the "Frontend"
+  section of this same file for some time.)
+- ~~**Nothing surfaces the re-validate action.**~~ Stale — the invoice detail screen has a
+  Re-validate button. What is still missing is a **line-item** correction path: a document held
+  by a low-confidence line item can only be re-validated wholesale, because line items remain
+  uncorrectable.
+- **No browser-level end-to-end test.** The suite runs in jsdom, so CSS, layout and the Web
+  Animations timing of the lift effect are verified by hand and by nothing repeatable. A
+  Playwright run against the compose stack is the natural next step, and is blocked on the same
+  image-registry policy that blocks compose itself.
 - **No way to resolve an exception from the UI.** `invoiceExceptions.resolvedAt` is only ever
   set automatically by re-validation; a human cannot dismiss one.
-- **Duplicated constants.** `CONFIDENCE_REVIEW_THRESHOLD`, the correctable-field list and
-  the field labels are restated in `frontend/src/lib/confidence.ts`. The backend stays
-  authoritative (it returns `lowConfidenceFields` and rejects non-allowlisted fields), but
-  the copies can drift out of sync with no test to catch it.
 - **No pagination, filtering, or sorting** on the invoice list — it renders every invoice
-  the tenant has in one table.
-- **Purchase orders are API-only in the UI.** The detail screen shows the *match* against a PO,
-  but there is no screen to list, inspect or create purchase orders and no way to record a
-  goods receipt from the frontend — those go through `POST /purchase-orders` and
-  `/receipts` by hand.
-- **Nothing surfaces the re-validate action.** `POST /invoices/:id/revalidate` exists (the only
-  route out for an invoice held by a low-confidence *line item*, since line items still aren't
-  correctable) but no button calls it, and the 409 refusal on a mid-approval correction has no
-  UI affordance explaining it.
+  the tenant has in one table, and both the filters and the search box are client-side over
+  the whole set.
 - **`vendorName` is shown with a confidence score but is not editable**, because correcting
   it means re-linking a `Vendor` row rather than writing a column. It's the one field on the
   detail screen with a confidence and no Edit affordance.
-- **Vendor matching is exact-name.** `resolveVendor()` does no normalisation, so
-  "Acme Inc." and "Acme, Inc" become two vendors — and duplicate detection, which keys on
-  `vendorId`, won't see invoices from those two as related.
+- **The token lives in `localStorage`.** Pragmatic for a dev-issuer flow, and not what a
+  production build should do — an httpOnly cookie or an in-memory token with silent refresh
+  both survive XSS better.
 
 ### Inbound: three channels, one pipeline
 `POST /invoices` with a `fileUrl` remains the single ingestion path, and that is the point —

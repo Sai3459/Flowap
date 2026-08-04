@@ -40,6 +40,22 @@ export function rectOf(el: HTMLElement | null | undefined): DOMRect | undefined 
   return el ? el.getBoundingClientRect() : undefined;
 }
 
+/**
+ * Resolve an origin, which may already be a rect or may still be an element.
+ *
+ * Deliberately duck-typed rather than `origin instanceof DOMRect`. A rect that came from
+ * another realm — or from anything but this window's `DOMRect` constructor — fails that test
+ * and falls through to being treated as an element, where the missing `getBoundingClientRect`
+ * throws *inside* the requestAnimationFrame callback. Nothing catches that, so `onfinish` is
+ * never wired and the confirmation card stays on screen indefinitely, covering the workspace.
+ * Asking whether it can be measured cannot get that wrong.
+ */
+function originRect(origin: DOMRect | HTMLElement | null | undefined): DOMRect | undefined {
+  if (!origin) return undefined;
+  const el = origin as HTMLElement;
+  return typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : (origin as DOMRect);
+}
+
 interface EffectsApi {
   toast: (spec: ToastSpec) => void;
   lift: (spec: LiftSpec) => void;
@@ -89,8 +105,7 @@ export function EffectsProvider({ children }: { children: ReactNode }) {
       // Where the card should start: the centre of whatever was pressed, expressed as an
       // offset from where the card already sits (centred in the viewport).
       const card = node.getBoundingClientRect();
-      const from =
-        spec.origin instanceof DOMRect ? spec.origin : rectOf(spec.origin as HTMLElement | null);
+      const from = originRect(spec.origin);
       const dx = from ? from.left + from.width / 2 - (card.left + card.width / 2) : 0;
       const dy = from ? from.top + from.height / 2 - (card.top + card.height / 2) : 140;
 

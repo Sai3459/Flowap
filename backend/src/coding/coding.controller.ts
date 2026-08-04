@@ -54,11 +54,11 @@ export class CodingController {
   @Roles('AP_CLERK', 'AP_MANAGER', 'CONTROLLER')
   @Patch('invoices/:invoiceId/lines/:lineId/code')
   codeLine(
-    @CurrentUser() { tenantId }: Principal,
+    @CurrentUser() { tenantId, userId }: Principal,
     @Param('invoiceId') invoiceId: string,
     @Param('lineId') lineId: string,
     @Body() dto: CodeLineDto,
   ) {
-    return this.coding.codeLine(tenantId, invoiceId, lineId, dto);
+    return this.coding.codeLine(tenantId, invoiceId, lineId, dto, userId);
   }
 }

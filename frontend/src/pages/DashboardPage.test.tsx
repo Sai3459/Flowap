@@ -3,6 +3,7 @@ import { screen, within } from '@testing-library/react';
 import { DashboardPage } from './DashboardPage';
 import { fakeApi, nestError } from '../test-support/fake-api';
 import { renderScreen, signIn } from '../test-support/render';
+import { touchlessSummary } from '../test-support/fixtures';
 
 /**
  * The overview. It is a single aggregate read, so most of it is rendering — but two numbers on
@@ -11,7 +12,8 @@ import { renderScreen, signIn } from '../test-support/render';
  */
 
 const summary = (over: Record<string, unknown> = {}) => ({
-  totals: { invoices: 18, touchlessRate: 61, purchaseOrders: 2, vendors: 4 },
+  totals: { invoices: 18, touchlessRate: 25, straightThroughRate: 0, purchaseOrders: 2, vendors: 4 },
+  touchless: touchlessSummary(),
   byStatus: [
     { status: 'PENDING_APPROVAL', count: 3, value: '4200.00' },
     { status: 'POSTED', count: 5, value: '9000.00' },
@@ -33,7 +35,15 @@ describe('the overview', () => {
     renderScreen(<DashboardPage />);
 
     expect(await screen.findByText('18')).toBeInTheDocument();
-    expect(screen.getByText('61%')).toBeInTheDocument();
+
+    // Scoped to the tile: the same percentage legitimately appears again in the breakdown
+    // table's share-of-completed column, and an unscoped match would pass on the wrong one.
+    const touchlessTile = screen.getByText('Touchless').closest('.card') as HTMLElement;
+    expect(within(touchlessTile).getByText('25%')).toBeInTheDocument();
+    expect(within(touchlessTile).getByText(/1\/4 completed/)).toBeInTheDocument();
+
+    const stTile = screen.getByText('Straight-through').closest('.card') as HTMLElement;
+    expect(within(stTile).getByText('0%')).toBeInTheDocument();
 
     const exceptions = screen.getByText('Open exceptions').closest('.card') as HTMLElement;
     expect(within(exceptions).getByText(/MISSING.PO/)).toBeInTheDocument();
@@ -41,19 +51,32 @@ describe('the overview', () => {
   });
 
   it('SHOWS AN UNKNOWN TOUCHLESS RATE AS UNKNOWN, NOT AS ZERO', async () => {
-    // With no invoices there is no rate to report. Rendering 0% would say the pipeline is
-    // clearing nothing, which is a very different claim from having nothing to clear — and
-    // touchless rate is the number this product is judged on.
+    // With nothing completed there is no rate to report. Rendering 0% would say the pipeline
+    // is clearing nothing, which is a very different claim from nothing having finished — and
+    // this is the number the product is now positioned on.
     signIn();
     fakeApi({
       'GET /dashboard': {
-        body: summary({ totals: { invoices: 0, touchlessRate: null, purchaseOrders: 0, vendors: 0 } }),
+        body: summary({
+          totals: { invoices: 3, touchlessRate: null, straightThroughRate: null, purchaseOrders: 0, vendors: 0 },
+          touchless: touchlessSummary({
+            completedInvoices: 0,
+            touchless: 0,
+            straightThrough: 0,
+            touchlessRate: null,
+            straightThroughRate: null,
+            byPrimaryReason: { CORRECTION: 0, APPROVAL: 0, CODING: 0, POSTING: 0, EXCEPTION: 0 },
+            cycleHours: null,
+            inFlight: 3,
+          }),
+        }),
       },
     });
     renderScreen(<DashboardPage />);
 
-    expect(await screen.findByText('—')).toBeInTheDocument();
+    expect(await screen.findAllByText('—')).not.toHaveLength(0);
     expect(screen.queryByText('0%')).not.toBeInTheDocument();
+    expect(screen.getByText(/No invoice has reached the ERP yet/)).toBeInTheDocument();
   });
 
   it('reads the audit trail back as sentences rather than enum names', async () => {
@@ -80,5 +103,86 @@ describe('the overview', () => {
     fakeApi({ 'GET /dashboard': nestError(403, 'Forbidden resource') });
     renderScreen(<DashboardPage />);
     expect(await screen.findByText('Forbidden resource')).toBeInTheDocument();
+  });
+});
+
+describe('the touchless panel', () => {
+  const render = async (over: Parameters<typeof touchlessSummary>[0] = {}) => {
+    signIn();
+    fakeApi({ 'GET /dashboard': { body: summary({ touchless: touchlessSummary(over) }) } });
+    renderScreen(<DashboardPage />);
+    return (await screen.findByText('Touchless processing')).closest('.card') as HTMLElement;
+  };
+
+  it('STATES THE DENOMINATOR AND THE WORK IT EXCLUDES', async () => {
+    // The previous metric divided by every invoice ever received, including ones still in
+    // flight, and nothing on screen said so. A rate whose denominator is invisible cannot be
+    // checked by the person reading it — which is the whole problem with quoting it.
+    const panel = await render();
+    expect(within(panel).getByText(/4 completed · 14 still in flight/)).toBeInTheDocument();
+    expect(within(panel).getByText(/not from current status/)).toBeInTheDocument();
+  });
+
+  it('SHOWS BOTH RATES, SO THE FRIENDLIER ONE IS NOT QUOTED ALONE', async () => {
+    // 25% touchless and 0% straight-through are both true and mean different things. The
+    // published 80% benchmark is the second definition, so showing only the first next to it
+    // would be comparing two different measurements.
+    await render();
+    const touchlessTile = screen.getByText('Touchless').closest('.card') as HTMLElement;
+    const stTile = screen.getByText('Straight-through').closest('.card') as HTMLElement;
+
+    expect(within(touchlessTile).getByText('25%')).toBeInTheDocument();
+    expect(within(touchlessTile).getByText(/no correction, no manual approval/)).toBeInTheDocument();
+    expect(within(stTile).getByText('0%')).toBeInTheDocument();
+    expect(within(stTile).getByText(/zero human touches of any kind/)).toBeInTheDocument();
+  });
+
+  it('ATTRIBUTES EACH TOUCHED INVOICE TO ONE REASON, SO THE COLUMN SUMS', async () => {
+    // Read as "fix this and N invoices become touchless". If an invoice were counted under
+    // every reason it hit, the column would exceed the number of invoices and the panel would
+    // overstate what any single fix buys.
+    const panel = await render();
+    const rows = within(panel).getAllByRole('row').slice(1);
+    const counts = rows.map((r) => Number(r.querySelectorAll('td')[1].textContent));
+    expect(counts.reduce((a, b) => a + b, 0)).toBe(3); // 4 completed − 1 touchless
+    expect(within(panel).getByText('Why 3 invoice(s) needed a human')).toBeInTheDocument();
+  });
+
+  it('names the reasons in words rather than enum values', async () => {
+    const panel = await render();
+    expect(within(panel).getByText('A field had to be corrected')).toBeInTheDocument();
+    expect(within(panel).getByText('Someone had to approve it')).toBeInTheDocument();
+    expect(within(panel).queryByText('CORRECTION')).not.toBeInTheDocument();
+  });
+
+  it('DISCLOSES AUTONOMOUS ACTIONS, WHICH ARE WHAT MOVE THE RATE', async () => {
+    // A copilot action is deliberately not a human touch, so labelling something COPILOT
+    // improves this number. Reporting the count keeps "the pipeline needed less" separable
+    // from "the copilot did more" — without it the rate could rise for either reason and the
+    // reader could not tell which.
+    const panel = await render({ copilotActions: 7 });
+    expect(within(panel).getByText(/resolved\s+autonomously and are not counted as human touches/)).toBeInTheDocument();
+    expect(within(panel).getByText('7')).toBeInTheDocument();
+  });
+
+  it('says nothing about autonomy when nothing was autonomous', async () => {
+    const panel = await render({ copilotActions: 0 });
+    expect(within(panel).queryByText(/autonomously/)).not.toBeInTheDocument();
+  });
+
+  it('reports a clean sweep rather than an empty table', async () => {
+    const panel = await render({
+      completedInvoices: 3,
+      touchless: 3,
+      touchlessRate: 100,
+      byPrimaryReason: { CORRECTION: 0, APPROVAL: 0, CODING: 0, POSTING: 0, EXCEPTION: 0 },
+    });
+    expect(within(panel).getByText('Every completed invoice cleared without a human.')).toBeInTheDocument();
+  });
+
+  it('reports cycle time as percentiles', async () => {
+    // A mean is dragged somewhere no invoice has been by a few stuck behind an absent approver.
+    const panel = await render({ cycleHours: { median: 4.5, p90: 30 } });
+    expect(within(panel).getByText(/Median receipt-to-posted 4.5h, 90th percentile 30h/)).toBeInTheDocument();
   });
 });

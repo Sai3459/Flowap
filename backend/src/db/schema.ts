@@ -465,10 +465,30 @@ export const auditEvents = pgTable('audit_events', {
   invoiceId: uuid('invoice_id').references(() => invoices.id),
   tenantId: uuid('tenant_id').notNull(),
   actorId: uuid('actor_id'),
+  /**
+   * *What kind of thing* took this action: 'SYSTEM' | 'HUMAN' | 'COPILOT'.
+   *
+   * `actorId` alone cannot answer this. It is null for everything the pipeline does, and a
+   * null could equally mean "the system did it" or "a human did it and nobody recorded who" —
+   * which is exactly what it did mean before this column existed, on every FIELD_CORRECTED
+   * and every APPROVAL_STEP_DECIDED row.
+   *
+   * The touchless rate is defined over human actions, so an unattributed human action makes
+   * the rate look *better*. Errors in a metric used for a sales claim should not all point the
+   * same way, so this is `notNull` with a SYSTEM default and the writers pass it explicitly.
+   *
+   * 'COPILOT' is a distinct value rather than a flavour of SYSTEM on purpose: an action a
+   * model chose is a different claim from an action a deterministic rule took, and once the
+   * two are indistinguishable in the trail, "what did the AI do to this invoice" stops being
+   * an answerable question.
+   */
+  actorKind: text('actor_kind').notNull().default('SYSTEM'),
   action: text('action').notNull(),
   detail: jsonb('detail'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
   tenantIdx: index('audit_tenant_idx').on(t.tenantId),
   invoiceIdx: index('audit_invoice_idx').on(t.invoiceId),
+  // The touchless aggregation groups a tenant's events by invoice and action.
+  touchIdx: index('audit_touch_idx').on(t.tenantId, t.invoiceId, t.actorKind),
 }));

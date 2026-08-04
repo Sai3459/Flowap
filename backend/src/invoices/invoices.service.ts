@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { and, desc, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { SYSTEM_ACTOR, type AuditActor } from '../metrics/touchless';
 import {
   approvalInstances,
   approvalSteps,
@@ -449,7 +450,17 @@ export class InvoicesService {
    * `force` is for an explicit human request (the endpoint); automatic re-validation after a
    * correction leaves the confidence gate in place.
    */
-  async revalidate(tenantId: string, invoiceId: string, opts: { force?: boolean } = {}) {
+  async revalidate(
+    tenantId: string,
+    invoiceId: string,
+    opts: { force?: boolean; actor?: AuditActor } = {},
+  ) {
+    // Who asked. A re-validation triggered by a late purchase order arriving is the system
+    // clearing its own backlog; one triggered from the endpoint is a person who had to
+    // intervene. Only the second is a touch, and nothing but this parameter can tell them
+    // apart after the fact — `force` is a near-proxy today and would silently stop being one
+    // the first time anything else forced a re-run.
+    const actor = opts.actor ?? SYSTEM_ACTOR;
     const [invoice] = await this.db
       .select()
       .from(invoices)
@@ -470,10 +481,13 @@ export class InvoicesService {
       // Audited, not just logged: a correction that could not be re-checked leaves the
       // invoice running on the previous validation's conclusions, and that needs to be
       // visible on the invoice itself rather than only in the server log.
-      await this.logAudit(tenantId, invoiceId, 'REVALIDATION_SKIPPED', {
-        reason: decision.reason,
-        status: invoice.status,
-      });
+      await this.logAudit(
+        tenantId,
+        invoiceId,
+        'REVALIDATION_SKIPPED',
+        { reason: decision.reason, status: invoice.status },
+        actor,
+      );
       return { revalidated: false, reason: decision.reason, invoice: await this.findOne(tenantId, invoiceId) };
     }
 
@@ -485,6 +499,7 @@ export class InvoicesService {
         tenantId,
         invoiceId,
         opts.force ? 're-validated on explicit request' : 're-validated after a field correction',
+        actor,
       );
     }
 
@@ -496,15 +511,18 @@ export class InvoicesService {
       .set({ resolvedAt: now })
       .where(and(eq(invoiceExceptions.invoiceId, invoiceId), isNull(invoiceExceptions.resolvedAt)));
 
-    await this.logAudit(tenantId, invoiceId, 'REVALIDATION_STARTED', {
-      previousStatus: invoice.status,
-      forced: opts.force ?? false,
-    });
+    await this.logAudit(
+      tenantId,
+      invoiceId,
+      'REVALIDATION_STARTED',
+      { previousStatus: invoice.status, forced: opts.force ?? false },
+      actor,
+    );
 
     await this.runValidation(tenantId, invoiceId);
 
     const refreshed = await this.findOne(tenantId, invoiceId);
-    await this.logAudit(tenantId, invoiceId, 'REVALIDATION_COMPLETE', { status: refreshed.status });
+    await this.logAudit(tenantId, invoiceId, 'REVALIDATION_COMPLETE', { status: refreshed.status }, actor);
 
     return { revalidated: true, reason: decision.reason, invoice: refreshed };
   }
@@ -842,10 +860,16 @@ export class InvoicesService {
       } as Partial<typeof invoices.$inferInsert>)
       .where(eq(invoices.id, invoiceId));
 
-    await this.logAudit(tenantId, invoiceId, 'FIELD_CORRECTED', {
-      fieldName: dto.fieldName,
-      correctedValue: dto.correctedValue,
-    });
+    // Attributed to the person, and that attribution is load-bearing: a correction is the
+    // touch that most directly means extraction failed, so a correction recorded without an
+    // actor would quietly count this invoice as having cleared on its own.
+    await this.logAudit(
+      tenantId,
+      invoiceId,
+      'FIELD_CORRECTED',
+      { fieldName: dto.fieldName, correctedValue: dto.correctedValue },
+      { actorId: actor.userId, actorKind: 'HUMAN' },
+    );
 
     // Production: also POST this correction to the extraction service's /feedback
     // endpoint so the per-tenant example set improves for next time.
@@ -860,6 +884,9 @@ export class InvoicesService {
     const clearedLastReviewFlag = invoice.status === 'NEEDS_REVIEW' && outstanding.length === 0;
 
     if (spec.revalidates || clearedLastReviewFlag) {
+      // SYSTEM, not the correcting user: the *correction* is the human touch and is already
+      // recorded as one. Attributing the automatic re-run to them as well would count one
+      // human action twice in the breakdown of why an invoice was not touchless.
       await this.revalidate(tenantId, invoiceId);
     }
 
@@ -982,12 +1009,25 @@ export class InvoicesService {
     };
   }
 
+  /**
+   * Writes an audit row, attributed.
+   *
+   * `actor` defaults to the system. That default is the safe direction for *this* method —
+   * every caller here that is not passing an actor is genuinely the pipeline acting on its
+   * own — but it is the unsafe direction for the touchless rate, since an unattributed human
+   * action makes the number look better. `touchless.int-spec.ts` asserts that every action
+   * classified as a touch is actually written with a HUMAN actor by the path a person takes,
+   * so a new human action cannot quietly inherit this default.
+   */
   private async logAudit(
     tenantId: string,
     invoiceId: string,
     action: string,
     detail: Record<string, unknown>,
+    actor: AuditActor = SYSTEM_ACTOR,
   ) {
-    await this.db.insert(auditEvents).values({ tenantId, invoiceId, action, detail });
+    await this.db
+      .insert(auditEvents)
+      .values({ tenantId, invoiceId, action, detail, actorId: actor.actorId ?? null, actorKind: actor.actorKind });
   }
 }

@@ -208,8 +208,41 @@ export interface PurchaseOrder {
 
 // ---- dashboard ----
 
+export type TouchKind = 'CORRECTION' | 'APPROVAL' | 'CODING' | 'POSTING' | 'EXCEPTION';
+
+/**
+ * The touchless measurement, derived from the audit trail rather than from invoice status.
+ *
+ * Two rates on purpose. `touchlessRate` is the internal definition — nobody had to correct a
+ * field or make an approval decision. `straightThroughRate` also excludes coding the lines and
+ * clicking Post, and is the only one comparable to a published "zero touches, receipt to
+ * payment" benchmark. Both are shown, because quoting the first against the second's benchmark
+ * would be comparing two different things.
+ *
+ * A rate is `null`, never 0, when nothing has completed: "cleared none of them" and "none have
+ * finished yet" are different claims.
+ */
+export interface TouchlessSummary {
+  completedInvoices: number;
+  touchless: number;
+  straightThrough: number;
+  touchlessRate: number | null;
+  straightThroughRate: number | null;
+  byPrimaryReason: Record<TouchKind, number>;
+  copilotActions: number;
+  cycleHours: { median: number; p90: number } | null;
+  inFlight: number;
+}
+
 export interface DashboardSummary {
-  totals: { invoices: number; touchlessRate: number | null; purchaseOrders: number; vendors: number };
+  totals: {
+    invoices: number;
+    touchlessRate: number | null;
+    straightThroughRate: number | null;
+    purchaseOrders: number;
+    vendors: number;
+  };
+  touchless: TouchlessSummary;
   byStatus: { status: InvoiceStatus; count: number; value: string }[];
   openExceptions: { type: string; count: number }[];
   overdueApprovals: number;

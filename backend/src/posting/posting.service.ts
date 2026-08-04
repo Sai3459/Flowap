@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { humanActor } from '../metrics/touchless';
 import { auditEvents, invoiceLineItems, invoices, vendors } from '../db/schema';
 
 /**
@@ -66,7 +67,7 @@ export class PostingService {
     await this.db.insert(auditEvents).values({
       tenantId,
       invoiceId,
-      actorId: postedById,
+      ...humanActor(postedById),
       action: 'INVOICE_POSTED',
       detail: { erpDocumentNumber, simulated: true, postedAt: postedAt.toISOString() },
     });

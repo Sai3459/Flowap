@@ -4,6 +4,7 @@ import { DashboardService } from './dashboard.service';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
 import { Roles } from '../auth/roles.decorator';
+import { MetricsModule } from '../metrics/metrics.controller';
 
 @ApiTags('dashboard')
 @ApiBearerAuth()
@@ -19,6 +20,7 @@ export class DashboardController {
 }
 
 @Module({
+  imports: [MetricsModule],
   controllers: [DashboardController],
   providers: [DashboardService],
 })

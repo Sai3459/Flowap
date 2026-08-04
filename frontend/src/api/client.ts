@@ -91,6 +91,19 @@ export const api = {
   // --- overview ---
   dashboard: () => request<DashboardSummary>('/dashboard'),
 
+  /** The per-invoice working behind the touchless rate, so a quoted number can be audited. */
+  touchlessBreakdown: () =>
+    request<
+      {
+        invoiceId: string;
+        postedAt: string | null;
+        touches: Record<string, number>;
+        touchless: boolean;
+        straightThrough: boolean;
+        primaryReason: string | null;
+      }[]
+    >('/metrics/touchless/breakdown'),
+
   // --- invoices ---
   listInvoices: () => request<InvoiceListItem[]>('/invoices'),
 

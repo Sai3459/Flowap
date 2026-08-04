@@ -18,6 +18,7 @@ import { PurchaseOrdersService } from '../purchase-orders/purchase-orders.servic
 import { CodingService } from '../coding/coding.service';
 import { PostingService } from '../posting/posting.service';
 import { DashboardService } from '../dashboard/dashboard.service';
+import { TouchlessService } from '../metrics/touchless.service';
 import { StubExtractionClient, scenario } from './fixtures';
 import type { TestDb } from './db';
 
@@ -29,6 +30,7 @@ export interface TestServices {
   coding: CodingService;
   posting: PostingService;
   dashboard: DashboardService;
+  touchless: TouchlessService;
   /** Controls what the next ingest will "extract". */
   extraction: StubExtractionClient;
 }
@@ -48,6 +50,8 @@ export function buildServices(db: TestDb): TestServices {
   );
   const purchaseOrders = new PurchaseOrdersService(database, vendors, invoices);
 
+  const touchless = new TouchlessService(database);
+
   return {
     invoices,
     workflow,
@@ -55,7 +59,8 @@ export function buildServices(db: TestDb): TestServices {
     purchaseOrders,
     coding: new CodingService(database),
     posting: new PostingService(database),
-    dashboard: new DashboardService(database),
+    dashboard: new DashboardService(database, touchless),
+    touchless,
     extraction,
   };
 }

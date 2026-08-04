@@ -12,6 +12,7 @@ import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
 import { CodingModule } from './coding/coding.module';
 import { PostingModule } from './posting/posting.module';
 import { DashboardModule } from './dashboard/dashboard.module';
+import { MetricsModule } from './metrics/metrics.controller';
 import { InboundModule } from './inbound/inbound.module';
 
 @Module({
@@ -29,6 +30,7 @@ import { InboundModule } from './inbound/inbound.module';
     CodingModule,
     PostingModule,
     DashboardModule,
+    MetricsModule,
     InboundModule,
   ],
 })

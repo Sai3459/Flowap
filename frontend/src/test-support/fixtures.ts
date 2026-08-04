@@ -7,6 +7,7 @@ import type {
   InvoiceListItem,
   LineItem,
   ReadyToPostItem,
+  TouchlessSummary,
 } from '../api/types';
 
 /**
@@ -146,5 +147,18 @@ export const approvalProgress = (over: Partial<ApprovalProgress> = {}): Approval
   approvalsRemaining: 1,
   totalApprovals: 1,
   steps: [step()],
+  ...over,
+});
+
+export const touchlessSummary = (over: Partial<TouchlessSummary> = {}): TouchlessSummary => ({
+  completedInvoices: 4,
+  touchless: 1,
+  straightThrough: 0,
+  touchlessRate: 25,
+  straightThroughRate: 0,
+  byPrimaryReason: { CORRECTION: 1, APPROVAL: 2, CODING: 0, POSTING: 0, EXCEPTION: 0 },
+  copilotActions: 0,
+  cycleHours: { median: 4.5, p90: 30 },
+  inFlight: 14,
   ...over,
 });

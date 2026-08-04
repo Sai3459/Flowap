@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { and, desc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { humanActor } from '../metrics/touchless';
 import {
   auditEvents,
   costCenters,
@@ -82,7 +83,7 @@ export class CodingService {
   // ---------- coding ----------
 
   /** Assigns (or clears) the GL account and cost centre on one invoice line. */
-  async codeLine(tenantId: string, invoiceId: string, lineId: string, dto: CodeLineDto) {
+  async codeLine(tenantId: string, invoiceId: string, lineId: string, dto: CodeLineDto, actorId?: string) {
     const invoice = await this.assertCodeable(tenantId, invoiceId);
 
     const [line] = await this.db
@@ -107,9 +108,13 @@ export class CodingService {
       .where(eq(invoiceLineItems.id, lineId))
       .returning();
 
+    // Coding is a human touch and always has been; it simply was not attributed. Every
+    // invoice in the product needs it before posting, which makes it the largest single
+    // reason the straight-through rate is what it is.
     await this.db.insert(auditEvents).values({
       tenantId,
       invoiceId,
+      ...humanActor(actorId),
       action: 'LINE_CODED',
       detail: {
         lineId,

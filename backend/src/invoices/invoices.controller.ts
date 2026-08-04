@@ -19,6 +19,7 @@ import { IngestInvoiceDto, CorrectFieldDto } from './dto/ingest-invoice.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { Principal } from '../auth/principal';
 import { Roles } from '../auth/roles.decorator';
+import { humanActor } from '../metrics/touchless';
 
 // Tenant is resolved from a header for the prototype. In production this comes from
 // the authenticated session (SSO claim), never a client-supplied header.
@@ -107,7 +108,8 @@ export class InvoicesController {
    */
   @Roles('AP_MANAGER', 'CONTROLLER')
   @Post(':id/revalidate')
-  revalidate(@CurrentUser() { tenantId }: Principal, @Param('id') id: string) {
-    return this.invoicesService.revalidate(tenantId, id, { force: true });
+  revalidate(@CurrentUser() { tenantId, userId }: Principal, @Param('id') id: string) {
+    // Explicit human request: an invoice that needed a person to push it is not touchless.
+    return this.invoicesService.revalidate(tenantId, id, { force: true, actor: humanActor(userId) });
   }
 }

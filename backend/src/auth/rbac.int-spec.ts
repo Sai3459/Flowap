@@ -26,6 +26,7 @@ import { CodingModule } from '../coding/coding.module';
 import { PurchaseOrdersModule } from '../purchase-orders/purchase-orders.module';
 import { InboundModule } from '../inbound/inbound.module';
 import { ErpModule } from '../erp/erp.module';
+import { MetricsModule } from '../metrics/metrics.controller';
 import { tenants, users } from '../db/schema';
 import { ROLES, type Role } from './principal';
 
@@ -95,6 +96,12 @@ const MATRIX: { method: string; path: string; allow: Role[]; body?: unknown }[] 
   // ERP sync. Interim: this wants a service identity, not a human role.
   { method: 'POST', path: '/purchase-orders', allow: ['AP_MANAGER', 'ADMIN'], body: {} },
 
+  // Touchless reporting. APPROVER is excluded for the same reason they cannot list invoices:
+  // being asked to approve one payment is not a reason to see the tenant's processing stats.
+  { method: 'GET', path: '/metrics/touchless', allow: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'] },
+  { method: 'GET', path: '/metrics/touchless/series', allow: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'] },
+  { method: 'GET', path: '/metrics/touchless/breakdown', allow: ['AP_CLERK', 'AP_MANAGER', 'CONTROLLER', 'ADMIN'] },
+
   // ERP connections hold credentials that can post into a customer's ledger — ADMIN only.
   { method: 'GET', path: '/admin/erp-connections', allow: ['ADMIN'] },
   { method: 'POST', path: '/admin/erp-connections', allow: ['ADMIN'], body: {} },
@@ -146,6 +153,7 @@ describe('role-based authorization', { skip: skipReason() }, () => {
         PurchaseOrdersModule,
         InboundModule,
         ErpModule,
+        MetricsModule,
       ],
     })
       .overrideProvider(DatabaseService)

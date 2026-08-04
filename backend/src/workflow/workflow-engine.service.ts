@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { SYSTEM_ACTOR, humanActor, type AuditActor } from '../metrics/touchless';
 import { authoriseApproval } from '../authority/approval-authority';
 import {
   tenants,
@@ -201,7 +202,7 @@ export class WorkflowEngineService {
    * nothing here left to recall — the correct response to a posted-in-error invoice is a
    * credit note or an ERP-side reversal, which this tool cannot request.
    */
-  async recallInstance(tenantId: string, invoiceId: string, reason: string) {
+  async recallInstance(tenantId: string, invoiceId: string, reason: string, actor: AuditActor = SYSTEM_ACTOR) {
     const [invoice] = await this.db
       .select()
       .from(invoices)
@@ -230,11 +231,13 @@ export class WorkflowEngineService {
       .set({ status: 'SUPERSEDED', reason, completedAt: new Date() })
       .where(eq(approvalInstances.id, instance.id));
 
-    await this.logAudit(tenantId, invoiceId, 'APPROVAL_INSTANCE_RECALLED', {
-      instanceId: instance.id,
-      reason,
-      cancelledSteps: cancelled.length,
-    });
+    await this.logAudit(
+      tenantId,
+      invoiceId,
+      'APPROVAL_INSTANCE_RECALLED',
+      { instanceId: instance.id, reason, cancelledSteps: cancelled.length },
+      actor,
+    );
 
     return instance;
   }
@@ -373,12 +376,16 @@ export class WorkflowEngineService {
       })
       .where(eq(approvalSteps.id, stepId));
 
-    await this.logAudit(tenantId, instance.invoiceId, 'APPROVAL_STEP_DECIDED', {
-      stepId,
-      nodeId: node.id,
-      decision: dto.decision,
-      approverId: dto.approverId,
-    });
+    // A manual approval click is a human touch, and this is where that becomes true in the
+    // record. `dto.approverId` is the session, not a value the caller chose — see the note on
+    // DecideStepDto — so the attribution is as trustworthy as the authorisation check above it.
+    await this.logAudit(
+      tenantId,
+      instance.invoiceId,
+      'APPROVAL_STEP_DECIDED',
+      { stepId, nodeId: node.id, decision: dto.decision, approverId: dto.approverId },
+      humanActor(dto.approverId),
+    );
 
     const siblingSteps = await this.db
       .select()
@@ -445,13 +452,19 @@ export class WorkflowEngineService {
       })
       .returning();
 
-    await this.logAudit(tenantId, instance.invoiceId, 'APPROVAL_STEP_DELEGATED', {
-      nodeId: node.id,
-      fromStepId: stepId,
-      toStepId: replacement.id,
-      fromApproverId: dto.fromApproverId,
-      toApproverId: dto.toApproverId,
-    });
+    await this.logAudit(
+      tenantId,
+      instance.invoiceId,
+      'APPROVAL_STEP_DELEGATED',
+      {
+        nodeId: node.id,
+        fromStepId: stepId,
+        toStepId: replacement.id,
+        fromApproverId: dto.fromApproverId,
+        toApproverId: dto.toApproverId,
+      },
+      humanActor(dto.fromApproverId),
+    );
 
     return this.getInstance(tenantId, instance.invoiceId);
   }
@@ -913,8 +926,17 @@ export class WorkflowEngineService {
     return this.findNode(graph, edge.to);
   }
 
-  private async logAudit(tenantId: string, invoiceId: string, action: string, detail: Record<string, unknown>) {
-    await this.db.insert(auditEvents).values({ tenantId, invoiceId, action, detail });
+  /** See the note on the same method in `InvoicesService`: SYSTEM is the default, humans are explicit. */
+  private async logAudit(
+    tenantId: string,
+    invoiceId: string,
+    action: string,
+    detail: Record<string, unknown>,
+    actor: AuditActor = SYSTEM_ACTOR,
+  ) {
+    await this.db
+      .insert(auditEvents)
+      .values({ tenantId, invoiceId, action, detail, actorId: actor.actorId ?? null, actorKind: actor.actorKind });
   }
 }
 

@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { and, desc, eq, isNull, lt, sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { TouchlessService } from '../metrics/touchless.service';
 import {
   approvalInstances,
   approvalSteps,
@@ -17,14 +18,17 @@ import {
  */
 @Injectable()
 export class DashboardService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly touchless: TouchlessService,
+  ) {}
 
   private get db() {
     return this.database.db;
   }
 
   async summary(tenantId: string) {
-    const [byStatus, openExceptions, overdue, awaitingApproval, posted, recent, poCount, vendorCount] =
+    const [byStatus, openExceptions, overdue, awaitingApproval, posted, recent, poCount, vendorCount, touchless] =
       await Promise.all([
         this.db
           .select({ status: invoices.status, count: sql<number>`count(*)::int`, value: sql<string>`coalesce(sum(${invoices.totalAmount}),0)::text` })
@@ -79,24 +83,28 @@ export class DashboardService {
 
         this.db.select({ count: sql<number>`count(*)::int` }).from(purchaseOrders).where(eq(purchaseOrders.tenantId, tenantId)),
         this.db.select({ count: sql<number>`count(*)::int` }).from(vendors).where(eq(vendors.tenantId, tenantId)),
+
+        this.touchless.summary(tenantId),
       ]);
 
-    const statusMap = Object.fromEntries(byStatus.map((r) => [r.status, r.count]));
     const total = byStatus.reduce((acc, r) => acc + r.count, 0);
-
-    // "Touched by a human" is the number that matters for an automation pitch: everything
-    // that needed review or hit an exception, against everything received.
-    const needingHumans =
-      (statusMap.NEEDS_REVIEW ?? 0) + (statusMap.EXCEPTION ?? 0);
-    const touchlessRate = total > 0 ? Math.round(((total - needingHumans) / total) * 100) : null;
 
     return {
       totals: {
         invoices: total,
-        touchlessRate,
+        // The headline rate now comes from `TouchlessService`, which reads the audit trail.
+        //
+        // What used to be here was `(total - inNeedsReviewOrException) / total`, computed from
+        // *current* status. It counted an invoice that a human corrected and then posted as
+        // touchless — because by then its status was POSTED — counted in-flight invoices that
+        // had not demonstrated anything yet, and never noticed an approval click at all. On
+        // this repository's own data it reported 39% where the real figure was 0%.
+        touchlessRate: touchless.touchlessRate,
+        straightThroughRate: touchless.straightThroughRate,
         purchaseOrders: poCount[0]?.count ?? 0,
         vendors: vendorCount[0]?.count ?? 0,
       },
+      touchless,
       byStatus,
       openExceptions,
       overdueApprovals: overdue[0]?.count ?? 0,

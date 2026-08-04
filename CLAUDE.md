@@ -158,10 +158,10 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 336 unit tests — no DB, no server
-cd backend && npm run test:integration   # 119 integration tests — needs DATABASE_URL
+cd backend && npm test               # 355 unit tests — no DB, no server
+cd backend && npm run test:integration   # 134 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
-cd frontend && npm test              # 150 tests (vitest + jsdom) — no DB, no server
+cd frontend && npm test              # 158 tests (vitest + jsdom) — no DB, no server
 cd frontend && npm run build         # typecheck + build (tsc -b && vite build)
 ```
 
@@ -177,7 +177,7 @@ truncate each other mid-run and everything fails at once.
 
 ### The frontend suite (`frontend/src/**/*.test.tsx`)
 
-Vitest + jsdom + Testing Library. 150 tests over the fourteen source modules; it needs no
+Vitest + jsdom + Testing Library. 158 tests over the fourteen source modules; it needs no
 server, no database and no browser, so it runs in about eleven seconds anywhere.
 
 **Screens are driven through the real `api/client.ts`, with the fake standing in at the
@@ -218,9 +218,9 @@ running API, so the CSS, the layout and the Web Animations timing of the lift ef
 verified only by hand.
 
 **CI is real.** `.github/workflows/ci.yml` fires on every push and has been green on GitHub's
-runners on every run so far. It runs three jobs: the backend's typecheck, 336 unit tests and
-119 integration tests against a real `postgres:16-alpine` service container; the extraction
-service's 19 Python tests; and the frontend's typecheck, build and 150 tests. So the suites are
+runners on every run so far. It runs three jobs: the backend's typecheck, 355 unit tests and
+134 integration tests against a real `postgres:16-alpine` service container; the extraction
+service's 19 Python tests; and the frontend's typecheck, build and 158 tests. So the suites are
 proven to pass on a clean machine from scratch, not just on a developer's warm one.
 
 (This entry previously said the workflow had never executed, then carried a run count that went
@@ -267,6 +267,75 @@ API docs: `http://localhost:3000/api/docs` (Swagger, auto-generated from decorat
 Note the backend restarts fussily: `npx ts-node` leaves a child `node` process behind, so
 killing only the wrapper PID silently fails the next start with `EADDRINUSE`. Kill every PID
 matching `ts-node src/main.ts` before restarting.
+
+## The touchless rate (how automated this actually is)
+
+The number the product is positioned on, so it is worth being exact about what it counts.
+
+**The old measure was wrong, and wrong in our favour.** It was a status snapshot —
+`(total - inNeedsReviewOrException) / total` — with three defects, all flattering:
+1. It read *current* status, so an invoice that went NEEDS_REVIEW, was corrected by a human and
+   then posted counted as **touchless**, because by then its status was POSTED. The most
+   expensive kind of touch was invisible to the metric measuring touches.
+2. It counted invoices still in flight, which have not demonstrated anything yet.
+3. It never saw an approval click at all.
+
+On this repository's own data it reported **39%** where the truthful figure was **0%**.
+
+**The measure now** (`src/metrics/`) is retrospective and per invoice: take the invoices that
+actually reached POSTED, read their audit trail, and count the ones no human acted on. Two
+rates are produced and **both are shown**:
+- **`touchlessRate`** — no human correction and no human approval decision. The internal
+  definition, and the one in the strategy brief.
+- **`straightThroughRate`** — no human action of *any* kind, including coding the lines and
+  clicking Post. This is what published benchmarks mean by "zero touches, receipt to payment"
+  and the only one comparable to an 80% claim. Showing only the first next to that benchmark
+  would compare two different measurements.
+
+A rate over zero completed invoices is **`null`, never `0`** — "cleared none of them" and
+"none have finished" are different claims, and a new tenant should not open the dashboard to
+0% automation.
+
+### What made it measurable: actor attribution
+`auditEvents.actorKind` (`SYSTEM | HUMAN | COPILOT`, `drizzle/0007_audit_actor_kind.sql`).
+Before it, `logAudit` never passed `actorId` for corrections or approvals, so a null actor
+could equally mean "the system did it" or "a person did and nobody recorded who" — and an
+unattributed human action makes the rate look better. Only `HUMAN` counts as a touch. The
+migration backfills the actions that could only have been a person at the time; it deliberately
+leaves `REVALIDATION_STARTED` and `APPROVAL_INSTANCE_RECALLED` as SYSTEM, because both are
+genuinely mixed in history and guessing would put invented data behind a published number.
+
+`COPILOT` is a distinct value rather than a flavour of SYSTEM. An action a model chose is a
+different claim from one a deterministic rule took, and once they are indistinguishable in the
+trail, "what did the AI do to this invoice" stops being answerable. **Nothing writes COPILOT
+yet.** Because a COPILOT label removes a touch, `copilotActions` is reported alongside the
+rate — so "the pipeline needed less" stays separable from "the copilot did more".
+
+### Measured on our own corpus
+`GET /metrics/touchless`, live server, 18 invoices of which 4 completed:
+
+| | |
+|---|---|
+| Touchless | **0%** (0 of 4) |
+| Straight-through | **0%** (0 of 4) |
+| Why not | 3 needed an approval click, 1 needed a field correction |
+| Also on all 4 | lines coded by hand, posted by hand |
+| In flight | 14, excluded from both rates |
+
+**The binding constraint is not extraction quality — it is that nothing can auto-approve.**
+The published graph routes *every* invoice, including sub-€1,000, through an APPROVAL node.
+The engine supports a `CONDITION → END` edge (conditions resolve in memory; it only parks at
+APPROVAL or terminal nodes) and `touchless.int-spec.ts` publishes exactly such a graph to prove
+the touchless path works — but no seeded or live definition uses one. Until a tenant configures
+one, the ceiling on `touchlessRate` is 0 no matter how good extraction gets. Coding and posting
+are the two further touches standing between that and a non-zero *straight-through* rate.
+
+Cycle time is reported as median and p90 rather than a mean: AP cycle time is heavily skewed,
+and a handful of invoices stuck behind an absent approver drag a mean somewhere no individual
+invoice has been. (The 0h figures above are an artefact of a corpus created in one sitting.)
+
+`GET /metrics/touchless/breakdown` returns the per-invoice working, because a rate nobody can
+audit is a rate nobody should quote.
 
 ## Core design decisions baked into the code (don't casually change these)
 
@@ -472,7 +541,7 @@ node — there's a regression test for exactly that.
     by breaking a number and watching it fail.
   - **`extraction-service/test_consistency.py`** — 19 tests for the arithmetic pass, which had
     none (see design decision 2).
-  - **150 frontend tests** (vitest + jsdom, `frontend/src/**/*.test.tsx`) — the last untested
+  - **158 frontend tests** (vitest + jsdom, `frontend/src/**/*.test.tsx`) — the last untested
     surface in the repo. Screens run against the real API client with a fake at the `fetch`
     boundary, so the assertions reach the actual request bodies. See "The frontend suite" under
     Tests for what that buys and what it still does not cover.
@@ -598,7 +667,7 @@ node — there's a regression test for exactly that.
   `GET /approvals/:invoiceId/progress`, which walks the graph forward to answer "how many more
   approvals does this need".
 - **Dashboard** — `GET /dashboard`: counts and value by status, open exceptions by type, overdue
-  approvals, touchless rate, and recent audit activity in one aggregate read.
+  approvals, the touchless rate (see below), and recent audit activity in one aggregate read.
 - **Frontend** (`frontend/`, React + TS + Vite) — a single role-switched workspace. The design
   system is a tonal blue-slate palette (`#212A31` ground, `#2E3944` panels, `#124E66` petrol
   accent, `#748D92` muted text, `#D3D9D4` ink) with monospace on every value and label and
@@ -609,7 +678,10 @@ node — there's a regression test for exactly that.
   components reference them by name and hard-code no colour.
   Verified in a real browser: upload → code → approve → post ran end to end and produced ERP
   document 5106040049.
-  - **Overview** — pipeline by status, open exceptions, overdue approvals, touchless rate, audit feed.
+  - **Overview** — pipeline by status, open exceptions, overdue approvals, audit feed, and the
+    touchless panel: both rates, the denominator and in-flight count stated on screen, and a
+    breakdown of *why* each completed invoice needed a human (attributed to one reason each, so
+    the column sums and reads as "fix this and N become touchless").
   - **Upload** — drag-and-drop inbound, showing each document's outcome immediately.
   - **Invoices** — filterable list with confidence and PO-match indicators and the ERP doc number.
   - **Invoice detail** — approval chain and progress meter, per-field confidence with inline
@@ -1107,6 +1179,10 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
 5. **AI copilot** — natural-language invoice search, smarter GL coding suggestions (today's are
    frequency counts over this vendor's history, not a model call), plain-language explanations
    of why an invoice is stuck (`_consistency_warnings` is a natural input).
+   **Autonomous exception resolution is proposed but not built** — the exception types and the
+   confidence threshold are awaiting review before anything auto-resolves a real invoice. The
+   `COPILOT` actor kind and the `copilotActions` disclosure on the dashboard exist ready for it;
+   nothing writes either.
 6. **Feedback loop** — `/feedback` on the extraction service is a stub; corrections should
    persist per tenant/vendor-layout and feed back into the prompt as few-shot examples.
 7. **Vendor portal** — separate, simplified auth context and shell.
@@ -1186,7 +1262,7 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
   which is exactly the dynamic approver type the workflow engine still lacks.
 
 ### Known gaps in the frontend
-- ~~**No tests at all.**~~ Built — 150 vitest tests, see "The frontend suite" above.
+- ~~**No tests at all.**~~ Built — 158 vitest tests, see "The frontend suite" above.
 - ~~**Identity is picked, not authenticated.**~~ Both were deleted when auth landed. The shell
   now signs in against the OIDC issuer and reads identity from `GET /auth/me`.
 - ~~**Duplicated constants.**~~ Still duplicated, but no longer unguarded: `confidence.test.ts`

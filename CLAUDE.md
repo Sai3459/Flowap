@@ -161,7 +161,7 @@ An account must already exist — a valid token for an unknown email is refused,
 cd backend && npm test               # 380 unit tests — no DB, no server
 cd backend && npm run test:integration   # 147 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
-cd frontend && npm test              # 158 tests (vitest + jsdom) — no DB, no server
+cd frontend && npm test              # 162 tests (vitest + jsdom) — no DB, no server
 cd frontend && npm run build         # typecheck + build (tsc -b && vite build)
 ```
 
@@ -177,7 +177,7 @@ truncate each other mid-run and everything fails at once.
 
 ### The frontend suite (`frontend/src/**/*.test.tsx`)
 
-Vitest + jsdom + Testing Library. 158 tests over the fourteen source modules; it needs no
+Vitest + jsdom + Testing Library. 162 tests over the fourteen source modules; it needs no
 server, no database and no browser, so it runs in about eleven seconds anywhere.
 
 **Screens are driven through the real `api/client.ts`, with the fake standing in at the
@@ -220,7 +220,7 @@ verified only by hand.
 **CI is real.** `.github/workflows/ci.yml` fires on every push and has been green on GitHub's
 runners on every run so far. It runs three jobs: the backend's typecheck, 380 unit tests and
 147 integration tests against a real `postgres:16-alpine` service container; the extraction
-service's 19 Python tests; and the frontend's typecheck, build and 158 tests. So the suites are
+service's 19 Python tests; and the frontend's typecheck, build and 162 tests. So the suites are
 proven to pass on a clean machine from scratch, not just on a developer's warm one.
 
 (This entry previously said the workflow had never executed, then carried a run count that went
@@ -336,6 +336,13 @@ invoice has been. (The 0h figures above are an artefact of a corpus created in o
 
 `GET /metrics/touchless/breakdown` returns the per-invoice working, because a rate nobody can
 audit is a rate nobody should quote.
+
+**Over time** is on the dashboard as a bar per week, bucketed by when an invoice *completed*
+rather than when it arrived: bucketing by receipt would leave the newest bucket permanently
+understated while its invoices were still in flight, so the chart would always appear to be
+getting worse at the right-hand edge. Each bar carries its denominator, because a 100% week
+made of one invoice and a 100% week made of two hundred are not the same claim and a bar chart
+flattens exactly that difference.
 
 ## The copilot: autonomous exception resolution (SHADOW only — not approved)
 
@@ -629,7 +636,7 @@ node — there's a regression test for exactly that.
     by breaking a number and watching it fail.
   - **`extraction-service/test_consistency.py`** — 19 tests for the arithmetic pass, which had
     none (see design decision 2).
-  - **158 frontend tests** (vitest + jsdom, `frontend/src/**/*.test.tsx`) — the last untested
+  - **162 frontend tests** (vitest + jsdom, `frontend/src/**/*.test.tsx`) — the last untested
     surface in the repo. Screens run against the real API client with a fake at the `fetch`
     boundary, so the assertions reach the actual request bodies. See "The frontend suite" under
     Tests for what that buys and what it still does not cover.
@@ -1349,7 +1356,7 @@ invoices, and nothing exercises a PO-matched, multi-line, multi-tax-rate documen
   which is exactly the dynamic approver type the workflow engine still lacks.
 
 ### Known gaps in the frontend
-- ~~**No tests at all.**~~ Built — 158 vitest tests, see "The frontend suite" above.
+- ~~**No tests at all.**~~ Built — 162 vitest tests, see "The frontend suite" above.
 - ~~**Identity is picked, not authenticated.**~~ Both were deleted when auth landed. The shell
   now signs in against the OIDC issuer and reads identity from `GET /auth/me`.
 - ~~**Duplicated constants.**~~ Still duplicated, but no longer unguarded: `confidence.test.ts`

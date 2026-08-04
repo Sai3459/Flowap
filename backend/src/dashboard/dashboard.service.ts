@@ -28,7 +28,7 @@ export class DashboardService {
   }
 
   async summary(tenantId: string) {
-    const [byStatus, openExceptions, overdue, awaitingApproval, posted, recent, poCount, vendorCount, touchless] =
+    const [byStatus, openExceptions, overdue, awaitingApproval, posted, recent, poCount, vendorCount, touchless, touchlessTrend] =
       await Promise.all([
         this.db
           .select({ status: invoices.status, count: sql<number>`count(*)::int`, value: sql<string>`coalesce(sum(${invoices.totalAmount}),0)::text` })
@@ -85,6 +85,7 @@ export class DashboardService {
         this.db.select({ count: sql<number>`count(*)::int` }).from(vendors).where(eq(vendors.tenantId, tenantId)),
 
         this.touchless.summary(tenantId),
+        this.touchless.series(tenantId, { weeks: 12 }),
       ]);
 
     const total = byStatus.reduce((acc, r) => acc + r.count, 0);
@@ -105,6 +106,10 @@ export class DashboardService {
         vendors: vendorCount[0]?.count ?? 0,
       },
       touchless,
+      // The rate over time, bucketed by the week an invoice *completed*. Bucketing by receipt
+      // would leave the right-hand edge permanently understated while those invoices were
+      // still in flight — a chart that always appears to be getting worse.
+      touchlessTrend,
       byStatus,
       openExceptions,
       overdueApprovals: overdue[0]?.count ?? 0,

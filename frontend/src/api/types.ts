@@ -234,6 +234,16 @@ export interface TouchlessSummary {
   inFlight: number;
 }
 
+export interface TouchlessPoint {
+  /** ISO date of the week the invoices in this bucket *completed*. */
+  bucket: string;
+  completedInvoices: number;
+  touchless: number;
+  straightThrough: number;
+  touchlessRate: number | null;
+  straightThroughRate: number | null;
+}
+
 export interface DashboardSummary {
   totals: {
     invoices: number;
@@ -243,6 +253,7 @@ export interface DashboardSummary {
     vendors: number;
   };
   touchless: TouchlessSummary;
+  touchlessTrend: TouchlessPoint[];
   byStatus: { status: InvoiceStatus; count: number; value: string }[];
   openExceptions: { type: string; count: number }[];
   overdueApprovals: number;

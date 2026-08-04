@@ -514,3 +514,18 @@ button.approve.bulb:hover { animation-play-state: paused; }
   .lift { animation: none !important; }
   button.approve.bulb { box-shadow: 0 0 0 1px var(--clear) inset; background: rgba(143,184,156,0.24); }
 }
+
+/* --- touchless trend ------------------------------------------------------------------ */
+.trend { display: flex; flex-direction: column; gap: 0.45rem; margin: 0.8rem 0 1rem; }
+.trend-bars { display: flex; align-items: flex-end; gap: 0.35rem; height: 5.5rem; }
+.trend-bar {
+  flex: 1 1 0; min-width: 2.2rem; display: flex; flex-direction: column;
+  align-items: center; justify-content: flex-end; height: 100%; gap: 0.2rem;
+}
+.trend-bar i {
+  display: block; width: 100%; background: var(--clear); opacity: 0.75;
+  border-radius: 2px 2px 0 0; min-height: 2px;
+}
+.trend-bar:hover i { opacity: 1; }
+.trend-bar .n { font-size: 0.68rem; color: var(--ink); }
+.trend-bar .d { font-size: 0.62rem; color: var(--muted); }

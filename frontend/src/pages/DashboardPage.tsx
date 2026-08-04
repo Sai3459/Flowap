@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { DashboardSummary, TouchKind, TouchlessSummary } from '../api/types';
+import type { DashboardSummary, TouchKind, TouchlessPoint, TouchlessSummary } from '../api/types';
 import { useApi } from '../lib/useApi';
 import { ErrorNote, Loading, Money, StatusPill } from '../components/ui';
 
@@ -33,7 +33,7 @@ export function DashboardPage() {
   if (error) return <ErrorNote message={error} />;
   if (!data) return null;
 
-  const { totals, touchless, byStatus, openExceptions, overdueApprovals, awaitingApproval, posted, recentActivity } = data;
+  const { totals, touchless, touchlessTrend, byStatus, openExceptions, overdueApprovals, awaitingApproval, posted, recentActivity } = data;
 
   return (
     <>
@@ -87,7 +87,7 @@ export function DashboardPage() {
         </div>
       </div>
 
-      <TouchlessPanel touchless={touchless} />
+      <TouchlessPanel touchless={touchless} trend={touchlessTrend ?? []} />
 
       <div className="grid g-2">
         <div className="card">
@@ -208,7 +208,7 @@ const REASON_LABEL: Record<string, string> = {
  * this metric divided by every invoice ever received, including ones that had not finished, and
  * nothing on the dashboard said so.
  */
-function TouchlessPanel({ touchless }: { touchless: TouchlessSummary }) {
+function TouchlessPanel({ touchless, trend }: { touchless: TouchlessSummary; trend: TouchlessPoint[] }) {
   const reasons = (Object.keys(REASON_LABEL) as TouchKind[])
     .map((kind) => ({ kind, count: touchless.byPrimaryReason[kind] ?? 0 }))
     .filter((r) => r.count > 0);
@@ -248,6 +248,8 @@ function TouchlessPanel({ touchless }: { touchless: TouchlessSummary }) {
             </p>
           )}
 
+          <TouchlessTrend trend={trend} />
+
           {reasons.length === 0 ? (
             <p className="small" style={{ color: 'var(--clear)' }}>
               Every completed invoice cleared without a human.
@@ -278,6 +280,44 @@ function TouchlessPanel({ touchless }: { touchless: TouchlessSummary }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * The rate week by week, as a bar per bucket.
+ *
+ * Bucketed by *completion*, which is when an invoice's touchlessness is first knowable.
+ * Bucketing by receipt would leave the newest bucket permanently understated while its
+ * invoices were still in flight, producing a chart that always looks like it is getting worse
+ * at the right-hand edge.
+ *
+ * Each bar states its denominator on hover, because a 100% week made of one invoice and a 100%
+ * week made of two hundred are not the same claim, and a bar chart flattens that difference.
+ */
+function TouchlessTrend({ trend }: { trend: TouchlessPoint[] }) {
+  if (trend.length === 0) return null;
+
+  return (
+    <div className="trend">
+      <span className="lbl">Touchless by week completed</span>
+      <div className="trend-bars">
+        {trend.map((p) => (
+          <span
+            key={p.bucket}
+            className="trend-bar"
+            title={`Week of ${p.bucket}: ${p.touchlessRate ?? 0}% touchless, ${p.straightThroughRate ?? 0}% straight-through, over ${p.completedInvoices} completed invoice(s)`}
+          >
+            <i style={{ height: `${Math.max(p.touchlessRate ?? 0, 2)}%` }} />
+            <span className="n mono">{p.touchlessRate === null ? '—' : `${p.touchlessRate}%`}</span>
+            <span className="d mono">{p.bucket.slice(5)}</span>
+          </span>
+        ))}
+      </div>
+      <span className="mute small">
+        One bar per week, sized by touchless rate. Hover for the number of completed invoices
+        behind each — a 100% week over one invoice is not the same claim as one over two hundred.
+      </span>
     </div>
   );
 }

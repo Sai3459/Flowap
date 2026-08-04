@@ -3,7 +3,7 @@ import { screen, within } from '@testing-library/react';
 import { DashboardPage } from './DashboardPage';
 import { fakeApi, nestError } from '../test-support/fake-api';
 import { renderScreen, signIn } from '../test-support/render';
-import { touchlessSummary } from '../test-support/fixtures';
+import { touchlessPoint, touchlessSummary } from '../test-support/fixtures';
 
 /**
  * The overview. It is a single aggregate read, so most of it is rendering — but two numbers on
@@ -14,6 +14,7 @@ import { touchlessSummary } from '../test-support/fixtures';
 const summary = (over: Record<string, unknown> = {}) => ({
   totals: { invoices: 18, touchlessRate: 25, straightThroughRate: 0, purchaseOrders: 2, vendors: 4 },
   touchless: touchlessSummary(),
+  touchlessTrend: [touchlessPoint()],
   byStatus: [
     { status: 'PENDING_APPROVAL', count: 3, value: '4200.00' },
     { status: 'POSTED', count: 5, value: '9000.00' },
@@ -107,9 +108,9 @@ describe('the overview', () => {
 });
 
 describe('the touchless panel', () => {
-  const render = async (over: Parameters<typeof touchlessSummary>[0] = {}) => {
+  const render = async (over: Parameters<typeof touchlessSummary>[0] = {}, trend = [touchlessPoint()]) => {
     signIn();
-    fakeApi({ 'GET /dashboard': { body: summary({ touchless: touchlessSummary(over) }) } });
+    fakeApi({ 'GET /dashboard': { body: summary({ touchless: touchlessSummary(over), touchlessTrend: trend }) } });
     renderScreen(<DashboardPage />);
     return (await screen.findByText('Touchless processing')).closest('.card') as HTMLElement;
   };
@@ -184,5 +185,50 @@ describe('the touchless panel', () => {
     // A mean is dragged somewhere no invoice has been by a few stuck behind an absent approver.
     const panel = await render({ cycleHours: { median: 4.5, p90: 30 } });
     expect(within(panel).getByText(/Median receipt-to-posted 4.5h, 90th percentile 30h/)).toBeInTheDocument();
+  });
+});
+
+describe('the touchless trend', () => {
+  const renderTrend = async (trend: ReturnType<typeof touchlessPoint>[]) => {
+    signIn();
+    fakeApi({ 'GET /dashboard': { body: summary({ touchlessTrend: trend }) } });
+    renderScreen(<DashboardPage />);
+    return (await screen.findByText('Touchless processing')).closest('.card') as HTMLElement;
+  };
+
+  it('SHOWS THE RATE WEEK BY WEEK, NOT JUST THE LATEST NUMBER', async () => {
+    // "Over time" is the half of the ask a single percentage cannot answer: whether the number
+    // is moving, and in which direction.
+    const panel = await renderTrend([
+      touchlessPoint({ bucket: '2026-07-12', touchlessRate: 10 }),
+      touchlessPoint({ bucket: '2026-07-19', touchlessRate: 40 }),
+      touchlessPoint({ bucket: '2026-07-26', touchlessRate: 25 }),
+    ]);
+
+    const bars = panel.querySelectorAll('.trend-bar');
+    expect(bars).toHaveLength(3);
+    expect(within(panel).getByText('10%')).toBeInTheDocument();
+    expect(within(panel).getByText('40%')).toBeInTheDocument();
+  });
+
+  it('STATES THE DENOMINATOR BEHIND EACH BAR', async () => {
+    // A 100% week over one invoice and a 100% week over two hundred are not the same claim,
+    // and a bar chart flattens exactly that difference. The count is on the bar itself.
+    const panel = await renderTrend([
+      touchlessPoint({ bucket: '2026-07-26', touchlessRate: 100, completedInvoices: 1, touchless: 1 }),
+    ]);
+    const bar = panel.querySelector('.trend-bar')!;
+    expect(bar.getAttribute('title')).toMatch(/over 1 completed invoice/);
+    expect(bar.getAttribute('title')).toMatch(/100% touchless/);
+  });
+
+  it('renders nothing rather than an empty chart when no week has completed', async () => {
+    const panel = await renderTrend([]);
+    expect(panel.querySelector('.trend')).toBeNull();
+  });
+
+  it('shows a week with no completions as unknown rather than zero', async () => {
+    const panel = await renderTrend([touchlessPoint({ completedInvoices: 0, touchless: 0, touchlessRate: null })]);
+    expect(within(panel).getByText('—')).toBeInTheDocument();
   });
 });

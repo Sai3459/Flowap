@@ -8,6 +8,7 @@ import type {
   LineItem,
   ReadyToPostItem,
   TouchlessSummary,
+  TouchlessPoint,
 } from '../api/types';
 
 /**
@@ -160,5 +161,15 @@ export const touchlessSummary = (over: Partial<TouchlessSummary> = {}): Touchles
   copilotActions: 0,
   cycleHours: { median: 4.5, p90: 30 },
   inFlight: 14,
+  ...over,
+});
+
+export const touchlessPoint = (over: Partial<TouchlessPoint> = {}): TouchlessPoint => ({
+  bucket: '2026-07-26',
+  completedInvoices: 4,
+  touchless: 1,
+  straightThrough: 0,
+  touchlessRate: 25,
+  straightThroughRate: 0,
   ...over,
 });

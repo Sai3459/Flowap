@@ -20,6 +20,7 @@ import { PostingService } from '../posting/posting.service';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { TouchlessService } from '../metrics/touchless.service';
 import { CopilotService } from '../copilot/copilot.service';
+import { AutoApproveService } from '../workflow/auto-approve.service';
 import { StubExtractionClient, scenario } from './fixtures';
 import type { TestDb } from './db';
 
@@ -33,6 +34,7 @@ export interface TestServices {
   dashboard: DashboardService;
   touchless: TouchlessService;
   copilot: CopilotService;
+  autoApprove: AutoApproveService;
   /** Controls what the next ingest will "extract". */
   extraction: StubExtractionClient;
 }
@@ -41,7 +43,8 @@ export function buildServices(db: TestDb): TestServices {
   const database = { db } as unknown as DatabaseService;
   const extraction = new StubExtractionClient(scenario('cleanpo'));
 
-  const workflow = new WorkflowEngineService(database);
+  const autoApprove = new AutoApproveService(database);
+  const workflow = new WorkflowEngineService(database, autoApprove);
   const vendors = new VendorsService(database);
   const copilot = new CopilotService(database);
   const invoices = new InvoicesService(
@@ -61,6 +64,7 @@ export function buildServices(db: TestDb): TestServices {
     workflow,
     vendors,
     purchaseOrders,
+    autoApprove,
     coding: new CodingService(database),
     posting: new PostingService(database),
     dashboard: new DashboardService(database, touchless),

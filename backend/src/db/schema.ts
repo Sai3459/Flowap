@@ -94,6 +94,16 @@ export const tenants = pgTable('tenants', {
    * but "have we earned the right to turn it on", and only a shadow period answers that.
    */
   copilotMode: text('copilot_mode').notNull().default('OFF'),
+  /**
+   * Auto-approval policy, or null for off — and **null is the default and the only safe one**.
+   *
+   * There is no universally sensible ceiling: EUR 1,000 is a rounding error to one company and
+   * a month of spend to another. A default that shipped with a number would begin approving
+   * payments on day one for a tenant that never asked, so the column defaults to absent and an
+   * administrator has to choose. Shape is `AutoApprovePolicy` in `workflow/auto-approve.ts`,
+   * validated by `validateAutoApprovePolicy` before it is ever stored.
+   */
+  autoApprovePolicy: jsonb('auto_approve_policy'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

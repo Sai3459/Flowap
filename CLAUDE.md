@@ -158,8 +158,8 @@ An account must already exist — a valid token for an unknown email is refused,
 ## Tests
 
 ```bash
-cd backend && npm test               # 380 unit tests — no DB, no server
-cd backend && npm run test:integration   # 147 integration tests — needs DATABASE_URL
+cd backend && npm test               # 400 unit tests — no DB, no server
+cd backend && npm run test:integration   # 161 integration tests — needs DATABASE_URL
 cd extraction-service && .venv/bin/python -m pytest -q   # 19 tests
 cd frontend && npm test              # 162 tests (vitest + jsdom) — no DB, no server
 cd frontend && npm run build         # typecheck + build (tsc -b && vite build)
@@ -218,8 +218,8 @@ running API, so the CSS, the layout and the Web Animations timing of the lift ef
 verified only by hand.
 
 **CI is real.** `.github/workflows/ci.yml` fires on every push and has been green on GitHub's
-runners on every run so far. It runs three jobs: the backend's typecheck, 380 unit tests and
-147 integration tests against a real `postgres:16-alpine` service container; the extraction
+runners on every run so far. It runs three jobs: the backend's typecheck, 400 unit tests and
+161 integration tests against a real `postgres:16-alpine` service container; the extraction
 service's 19 Python tests; and the frontend's typecheck, build and 162 tests. So the suites are
 proven to pass on a clean machine from scratch, not just on a developer's warm one.
 
@@ -343,6 +343,66 @@ understated while its invoices were still in flight, so the chart would always a
 getting worse at the right-hand edge. Each bar carries its denominator, because a 100% week
 made of one invoice and a 100% week made of two hundred are not the same claim and a bar chart
 flattens exactly that difference.
+
+## Auto-approval (built, configured nowhere — awaiting sign-off)
+
+`src/workflow/auto-approve.ts`. The biggest single lever on the touchless rate: on this
+corpus, 3 of 4 completed invoices were disqualified by an approval click and 1 by a correction,
+so approval is 75% of the gap and the copilot addresses the other 25%.
+
+**The justification is not "the amount is small".** A €900 invoice for goods that never arrived
+is worse than a €50,000 invoice against an order somebody raised, received and reconciled. The
+real argument is that **the approval already happened**: raising the purchase order committed
+the spend, and recording the receipt confirmed it arrived. A matched, in-tolerance, received
+invoice is the third corner of a triangle whose other two corners a human already signed.
+
+### Nine gates, every one a veto
+No scoring, no weighting: a strong signal cannot compensate for a weak one, because "mostly
+fine" is not a basis for paying an invoice. Order is fixed so the blocking gate is stable.
+
+| Gate | Refuses when |
+|---|---|
+| `amount` | over the ceiling, or **no total at all** — zero sails under every ceiling |
+| `currency` | not the ceiling's currency; never converted |
+| `purchaseOrder` | no PO — nobody pre-approved the spend |
+| `variance` | any variance at all; the tolerance was already applied upstream |
+| `goodsReceipt` | billed more than recorded as received (waivable, for services) |
+| `exceptions` | any open exception |
+| `extractionConfidence` | any field below the review threshold |
+| `vendorHistory` | fewer than N posted invoices from this vendor (default 3) |
+| `vendorRejections` | **any** past rejection for this vendor — one is enough |
+
+**There is no default ceiling and the policy defaults to null.** €1,000 is a rounding error to
+one company and a month of spend to another; a default that shipped with a number would begin
+approving payments on day one for a tenant that never asked. `validateAutoApprovePolicy`
+refuses a policy with no ceiling or no currency at write time, because the symptom of a bad one
+is not an error message, it is invoices being paid.
+
+### No approval step is created
+The alternative was to create the step and mark it APPROVED. That row would carry a resolved
+`approverId`, so the chain would read as though that person approved something they never saw —
+a false record of who authorised a payment. Instead nothing is created and an
+`APPROVAL_AUTO_APPROVED` audit event records the complete gate-by-gate working, attributed to
+`SYSTEM` (a deterministic rule, not a model choice, so not `COPILOT`, and certainly not a
+human). An integration test confirms such an invoice is genuinely touchless by the metric.
+
+### Simulated on our own corpus — and it would clear nothing
+`AutoApproveService.simulate()` projects a candidate policy over invoices that already
+completed, changing nothing. Four candidate policies, 4 completed invoices:
+
+| Policy | Would auto-approve | Blocked by |
+|---|---|---|
+| 1,000 USD · 3 prior · receipt required | **0 / 4** | 3 amount, 1 no-PO |
+| ceiling raised to 100,000 | **0 / 4** | 2 variance, 1 currency, 1 no-PO |
+| receipt requirement waived too | **0 / 4** | unchanged |
+
+**Raising the threshold buys nothing here** — once the amount gate stops binding, the
+structural gates do. Across all 18 invoices only **4 are PO-matched and only 1 of those is
+variance-free**, and the corpus spans 2 currencies. This is not a defect in the mechanism (the
+integration test proves an eligible invoice auto-approves and becomes touchless); it is that
+this corpus was built to exercise *exception* paths, so it is deliberately full of the cases
+the policy must refuse. Expected yield on real traffic depends entirely on what share of a
+customer's invoices are clean PO-matched, and ours is 1 in 18.
 
 ## The copilot: autonomous exception resolution (SHADOW only — not approved)
 

@@ -9,6 +9,7 @@ import {
 import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { SYSTEM_ACTOR, humanActor, type AuditActor } from '../metrics/touchless';
+import { AutoApproveService } from './auto-approve.service';
 import { authoriseApproval } from '../authority/approval-authority';
 import {
   tenants,
@@ -32,7 +33,10 @@ type ApprovalStepRow = typeof approvalSteps.$inferSelect;
 export class WorkflowEngineService {
   private readonly logger = new Logger(WorkflowEngineService.name);
 
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly autoApprove: AutoApproveService,
+  ) {}
 
   private get db() {
     return this.database.db;
@@ -283,6 +287,19 @@ export class WorkflowEngineService {
       }
 
       if (node.type === 'APPROVAL') {
+        // The auto-approval decision point. Strictly additive: with no policy configured —
+        // the default for every tenant — `decide` returns ROUTE_TO_HUMAN and the two lines
+        // below run exactly as they did before this existed.
+        //
+        // When it does fire, no approval step is created. Creating one and marking it APPROVED
+        // was the alternative, and it is worse: the row would carry a resolved `approverId`,
+        // so the chain would read as though that person approved something they never saw.
+        // An absent step plus an explicit audit event cannot be misread that way.
+        if (await this.tryAutoApprove(tenantId, instance, node)) {
+          node = this.nextNode(graph, node, isApproveEdge);
+          continue;
+        }
+
         await this.createStepsForNode(tenantId, instance, node);
         return this.setCurrentNode(instance, node.id);
       }
@@ -310,6 +327,37 @@ export class WorkflowEngineService {
       throw new Error(`CONDITION node ${node.id} has no matching or default edge`);
     }
     return this.findNode(graph, chosen.to);
+  }
+
+  /**
+   * Asks the tenant's auto-approval policy whether this node needs a person at all.
+   *
+   * Returns false — carry on and ask a human — for every tenant without a policy, which is all
+   * of them by default. A `true` writes an `APPROVAL_AUTO_APPROVED` audit event carrying the
+   * full gate-by-gate working, attributed to SYSTEM: it is a deterministic rule, not a model
+   * choice, so it is not COPILOT, and it is certainly not a human touch.
+   */
+  private async tryAutoApprove(
+    tenantId: string,
+    instance: ApprovalInstanceRow,
+    node: WorkflowNode,
+  ): Promise<boolean> {
+    const [invoice] = await this.db.select().from(invoices).where(eq(invoices.id, instance.invoiceId));
+    if (!invoice) return false;
+
+    const decision = await this.autoApprove.decide(tenantId, invoice);
+    if (decision.outcome !== 'AUTO_APPROVE') return false;
+
+    await this.logAudit(tenantId, instance.invoiceId, 'APPROVAL_AUTO_APPROVED', {
+      nodeId: node.id,
+      reasoning: decision.reasoning,
+      // Every gate, not just the ones that passed — an auditor asking "what was actually
+      // checked before this was paid" gets a complete answer rather than a summary.
+      gates: decision.gates,
+    });
+
+    this.logger.log(`Invoice ${instance.invoiceId} auto-approved at ${node.id}: ${decision.reasoning}`);
+    return true;
   }
 
   private async createStepsForNode(tenantId: string, instance: ApprovalInstanceRow, node: WorkflowNode) {
